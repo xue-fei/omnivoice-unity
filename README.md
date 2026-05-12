@@ -1,5 +1,7 @@
 # OmniVoice ONNX 导出 / 量化 / 推理
 
+[English README](README_EN.md)
+
 把 [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice)（PyTorch）转成 ONNX，覆盖 **导出 → 量化（INT8 / INT8-HQ / INT4 / FP16）→ 数值校验 → 端到端推理 → 性能基准** 全流程。
 
 > **当前生产推荐**：`int8hq`（LM 587→611 MB，audio output head 保留 FP32），数值 cos > 0.9999、argmax 一致率 > 80 %，听感几乎与 FP32 无异。详见 [§7.2](#72--int8-hq推荐生产)。

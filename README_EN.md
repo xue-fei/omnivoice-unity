@@ -12,7 +12,7 @@ This repository contains **only export / quantization / inference scripts**, not
 
 1. **OmniVoice PyTorch model** — Clone the main repo from [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice), download pretrained weights, and obtain an `OmniVoice/` layout (with `model.safetensors` + `audio_tokenizer/`).
 2. **`tts` conda environment** — Install dependencies per the main OmniVoice README (`torch`, `transformers>=5.5`, `onnx`, `onnxruntime`, `onnxsim`, `onnxconverter_common`, `torchaudio`).
-3. **Reference audio** (optional, only needed for `voice_clone` demos) — Any 24 kHz mono WAV; this document defaults to `assert/andelie.wav`.
+3. **Reference audio** (optional, only needed for `voice_clone` demos) — Any 24 kHz mono WAV; this document defaults to `zero_shot_prompt.wav`.
 
 Recommended layout:
 
@@ -21,10 +21,10 @@ your-workspace/
 ├── OmniVoice/                # Main k2-fsa/OmniVoice repo (with weights)
 │   ├── OmniVoice/             # Weight directory (PT_MODEL_DIR)
 │   ├── omnivoice/             # Python package
-│   ├── assert/andelie.wav     # Voice-clone reference
 │   └── onnx_export/           # ← Clone this repo here
 │       ├── _common.py
 │       ├── export_lm.py
+│       ├── zero_shot_prompt.wav     # Voice-clone reference
 │       └── ...
 ```
 
@@ -81,6 +81,7 @@ Source tree (artifacts land under `output/` at runtime; `output/` is `.gitignore
 ├── verify_audio_tokenizer.py # ONNX vs PyTorch (encoder / decoder)
 ├── test_pipeline.py           # End-to-end encode→decode using assert/andelie.wav
 ├── infer_onnx.py              # ★ End-to-end TTS: LM + tokenizer all ONNX
+├── zero_shot_prompt.wav       # Voice-clone reference
 └── benchmark_lm.py            # ★ LM single-step latency micro-benchmark (thread sweep)
 ```
 
@@ -333,7 +334,7 @@ Writes three WAVs under `output/inference_demo/int8hq/`:
 | File | Mode | Text | Highlights |
 |------|------|------|--------------|
 | `demo_auto.wav` | auto | Long English sentence | No reference tone |
-| `demo_voice_clone.wav` | voice clone | Short Mandarin | Uses `assert/andelie.wav` (Russian female reference) |
+| `demo_voice_clone.wav` | voice clone | Short Mandarin | Uses `zero_shot_prompt.wav` (Chinese female reference) |
 | `demo_voice_design.wav` | voice design | Short English | `instruct = "male, british accent, low pitch, middle-aged"` |
 
 **How to compare**: Listen to the same demo across `int8/`, `int8hq/`, `fp32/`, focusing on vowel hiss/metallic sheen (classic INT8 issue), HF crispness, phrase endings, and Mandarin tone/rhythm during clone runs.

@@ -12,7 +12,7 @@ audio-tokenizer decoder).  PyTorch is still loaded but only used for:
 Three demos are produced in ``output/inference_demo/``:
 
   1. ``demo_auto.wav``           — no reference, no instruction (auto voice)
-  2. ``demo_voice_clone.wav``    — clone the voice from ``assert/andelie.wav``
+  2. ``demo_voice_clone.wav``    — clone the voice from ``zero_short_prompt``
   3. ``demo_voice_design.wav``   — voice design via natural-language style prompt
 
 Run:
@@ -206,10 +206,8 @@ def load_pytorch_model(device: torch.device, dtype: torch.dtype = torch.float32)
 
 # ----------------------- demos ----------------------------------------------
 
-REF_TEXT_RU = (
-    "Здравствуйте, я Ханна, ваш автомобильный АИ помощник. "
-    "Я помогу узнать погоду, построить маршрут, включить музыку и сделать "
-    "поездку удобнее и безопаснее. Всегда рядом, чтобы помочь вам в дороге."
+REF_TEXT = (
+    "希望你以后过的比我还好哟！"
 )
 
 DEMOS = [
@@ -227,7 +225,7 @@ DEMOS = [
         "text": "你好，欢迎来到 OmniVoice。这是一段使用语音克隆模式生成的中文语音。",
         "language": "Chinese",
         "ref_audio": str(REF_AUDIO),
-        "ref_text": REF_TEXT_RU,
+        "ref_text": REF_TEXT,
     },
     {
         "name": "demo_voice_design",

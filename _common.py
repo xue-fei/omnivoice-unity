@@ -23,7 +23,7 @@ PT_MODEL_DIR = PROJECT_ROOT / "OmniVoice"
 AUDIO_TOKENIZER_DIR = PT_MODEL_DIR / "audio_tokenizer"
 
 # Reference asset for end-to-end test
-REF_AUDIO = PROJECT_ROOT / "assert" / "andelie.wav"
+REF_AUDIO = THIS_DIR / "zero_shot_prompt.wav"
 
 # Output layout — one folder per ONNX artefact, all under output/
 OUTPUT_DIR = THIS_DIR / "output"

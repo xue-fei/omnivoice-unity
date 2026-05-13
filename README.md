@@ -12,7 +12,7 @@
 
 1. **OmniVoice PyTorch 模型** —— 从 [k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice) 克隆主仓库并下载预训练权重，得到一个 `OmniVoice/` 目录（含 `model.safetensors` + `audio_tokenizer/`）。
 2. **`tts` conda 环境** —— 按 OmniVoice 主仓库的 README 安装依赖（`torch`, `transformers>=5.5`, `onnx`, `onnxruntime`, `onnxsim`, `onnxconverter_common`, `torchaudio`）。
-3. **参考音频**（可选，仅 `voice_clone` demo 需要）—— 任意一段 24 kHz mono wav，本文档默认引用 `assert/andelie.wav`。
+3. **参考音频**（可选，仅 `voice_clone` demo 需要）—— 任意一段 24 kHz mono wav，本文档默认引用 `zero_short_prompt`。
 
 推荐布局：
 
@@ -21,10 +21,10 @@ your-workspace/
 ├── OmniVoice/                # k2-fsa/OmniVoice 主仓库（含模型权重）
 │   ├── OmniVoice/             # 模型权重目录（PT_MODEL_DIR）
 │   ├── omnivoice/             # python 包
-│   ├── assert/andelie.wav     # voice_clone 参考音频
 │   └── onnx_export/           # ← 把本仓库克隆到这里
 │       ├── _common.py
 │       ├── export_lm.py
+│       ├── zero_short_prompt     # voice_clone 参考音频
 │       └── ...
 ```
 
@@ -80,6 +80,7 @@ OmniVoice 是一个文本→音频的 TTS 模型，由两部分组成：
 ├── verify_audio_tokenizer.py  # ONNX vs PyTorch 数值校验（encoder / decoder）
 ├── test_pipeline.py           # 用 assert/andelie.wav 跑端到端 encode→decode
 ├── infer_onnx.py              # ★ 端到端 TTS 推理：LM + tokenizer 全 ONNX
+├── zero_short_prompt          # voice_clone 参考音频
 └── benchmark_lm.py            # ★ LM 单步延迟微基准（线程扫描）
 ```
 
@@ -331,7 +332,7 @@ python infer_onnx.py --variant int8hq
 | 文件 | 模式 | 文本 | 关键 |
 |------|------|------|------|
 | `demo_auto.wav` | auto | 英文长句 | 无参考，模型自挑音色 |
-| `demo_voice_clone.wav` | voice clone | 中文短句 | 用 `assert/andelie.wav`（俄语女声）做参考 |
+| `demo_voice_clone.wav` | voice clone | 中文短句 | 用 `zero_short_prompt.wav`（中文女声）做参考 |
 | `demo_voice_design.wav` | voice design | 英文短句 | `instruct = "male, british accent, low pitch, middle-aged"` |
 
 **对比方法**：把同一个 demo 的 `int8/`、`int8hq/`、`fp32/` 三个版本依次对照听，重点听：

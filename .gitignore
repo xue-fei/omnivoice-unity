@@ -6,3 +6,5 @@ OmniVoice
 Temp
 *.sln
 *.dwlt
+.vs
+obj

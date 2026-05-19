@@ -36,6 +36,22 @@
         "com.unity.modules.imgui": "1.0.0"
       }
     },
+    "onnxruntime": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {},
+      "hash": "0ffce4473c50b3ff39cf915f50cc29c363c49fc7"
+    },
+    "onnxruntime-directml": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity-directml.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {
+        "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git#main"
+      },
+      "hash": "5dd6b9020e10cbd0a58e80357734925800d2c594"
+    },
     "com.unity.modules.ai": {
       "version": "1.0.0",
       "depth": 0,

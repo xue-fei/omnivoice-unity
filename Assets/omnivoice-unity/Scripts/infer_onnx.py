@@ -24,14 +24,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import struct
 import time
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import onnxruntime as ort
 import torch
-import torchaudio
 
 from _common import (
     AT_DEC_ONNX,
@@ -49,6 +50,43 @@ from _common import (
 log = setup_logging("infer_onnx")
 
 DEMO_ROOT = OUTPUT_DIR / "inference_demo"
+
+
+# ----------------------- WAV 保存（不依赖 torchcodec / FFmpeg）--------------
+
+def _save_wav(path: Path | str, audio_tensor: torch.Tensor, sample_rate: int) -> None:
+    """将音频张量保存为 WAV 文件，完全不依赖 torchaudio / torchcodec / FFmpeg。
+
+    优先使用 soundfile（质量好，支持 float32 直写）；
+    若 soundfile 不可用则回退到标准库 wave 模块（写 int16）。
+
+    Args:
+        path:         输出文件路径
+        audio_tensor: CPU 张量，形状 [1, T] 或 [T]，float32
+        sample_rate:  采样率（Hz）
+    """
+    pcm = audio_tensor.cpu().float()
+    if pcm.dim() == 2:
+        pcm = pcm.squeeze(0)   # [1, T] → [T]
+    pcm_np = pcm.numpy()       # shape: (T,)
+
+    try:
+        import soundfile as sf
+        sf.write(str(path), pcm_np, sample_rate)
+        log.debug("Saved via soundfile: %s", path)
+        return
+    except Exception as sf_err:
+        log.debug("soundfile unavailable (%s), falling back to wave module.", sf_err)
+
+    # 回退：标准库 wave（只支持 int16）
+    pcm16 = (pcm_np * 32767.0).clip(-32768, 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)        # 16-bit = 2 bytes
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16.tobytes())
+    log.debug("Saved via wave module: %s", path)
+
 
 # ----------------------- ONNX Runtime adapters ------------------------------
 
@@ -263,8 +301,23 @@ def run_demo(model, demo: dict, gen_kwargs: dict, demo_dir: Path) -> Path:
     audios = model.generate(**kwargs)
     elapsed = time.time() - t0
 
-    audio = audios[0]  # [1, T]
-    dur = audio.size(-1) / model.sampling_rate
+    audio = audios[0]  # [1, T] 可能是 numpy 或 torch tensor
+
+    # --- 增加对 numpy 数组的兼容处理 ---
+    if isinstance(audio, np.ndarray):
+        audio = torch.from_numpy(audio)
+    # 确保 audio 是 float32 且形状为 [1, T]
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)  # [T] -> [1, T]
+    elif audio.dim() == 2 and audio.shape[0] != 1:
+        # 如果形状是 [T, 1] 之类的，尝试转置为 [1, T]
+        if audio.shape[1] == 1:
+            audio = audio.t().contiguous()
+        else:
+            log.warning("Audio shape is %s, expected [1, T]. Taking first channel.", audio.shape)
+            audio = audio[0:1, :]  # 取第一通道并保持二维
+
+    dur = audio.shape[-1] / model.sampling_rate
     log.info(
         "  → wrote %s   audio=%.2fs  wallclock=%.1fs  RTF=%.2f",
         out_path.name,
@@ -272,7 +325,9 @@ def run_demo(model, demo: dict, gen_kwargs: dict, demo_dir: Path) -> Path:
         elapsed,
         elapsed / max(dur, 1e-6),
     )
-    torchaudio.save(str(out_path), audio.cpu(), model.sampling_rate)
+
+    # 使用不依赖 torchcodec/FFmpeg 的保存方式（修复 Windows 上的报错）
+    _save_wav(out_path, audio, model.sampling_rate)
     return out_path
 
 

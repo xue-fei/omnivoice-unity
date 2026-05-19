@@ -5,6 +5,7 @@ Logs
 OmniVoice
 Temp
 *.sln
+*.csproj
 *.dwlt
 .vs
 obj

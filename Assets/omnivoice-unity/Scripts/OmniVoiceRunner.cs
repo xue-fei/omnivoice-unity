@@ -91,7 +91,22 @@ public class OmniVoiceRunner : MonoBehaviour
             refCodes = _tokenizer.Encode(refPCM);
             T_ref = refCodes.GetLength(1);
             float refDur = T_ref * 960f / 24000f;
-            Debug.Log($"[OmniVoiceRunner] 参考音频: {refDur:F1}s ({T_ref} 帧)");
+            Debug.Log($"[OmniVoiceRunner] 参考音频原始: {refDur:F1}s ({T_ref} 帧)");
+
+            // ★ 修复：截断参考音频到 6 秒（约 150 帧），避免过长参考干扰开头生成
+            const int MAX_REF_FRAMES = 150; // 6s @ 25fps
+            if (T_ref > MAX_REF_FRAMES)
+            {
+                Debug.LogWarning($"[OmniVoiceRunner] 参考音频过长，截断至 {MAX_REF_FRAMES} 帧 (6s)");
+                var truncated = new long[OmniVoiceLM.NUM_CODEBOOKS, MAX_REF_FRAMES];
+                for (int cb = 0; cb < OmniVoiceLM.NUM_CODEBOOKS; cb++)
+                    for (int t = 0; t < MAX_REF_FRAMES; t++)
+                        truncated[cb, t] = refCodes[cb, t];
+                refCodes = truncated;
+                T_ref = MAX_REF_FRAMES;
+            }
+
+            if (refDur < 2f) Debug.LogWarning("参考音频过短（<< 2s），克隆质量可能较差");
         }
 
         // 2. 构建文本 prompt

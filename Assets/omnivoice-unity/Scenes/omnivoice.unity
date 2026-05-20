@@ -299,10 +299,10 @@ MonoBehaviour:
   decModelRelPath: OmniVoice/audio_tokenizer_decoder_int8/model.onnx
   tokenizerJsonRelPath: OmniVoice/tokenizer.json
   numStep: 32
-  guidanceScale: 0
+  guidanceScale: 2
   tShift: 0.1
   maskTemperature: 5
-  layerPenaltyFactor: 5
+  layerPenaltyFactor: 1
   targetDurSec: 0
 --- !u!82 &384914473
 AudioSource:

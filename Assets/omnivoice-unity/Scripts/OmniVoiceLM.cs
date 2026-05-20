@@ -18,14 +18,15 @@ public class OmniVoiceLM : IDisposable
     InferenceSession _session;
     System.Random _rng;
 
+    // ─── 生成参数 ────────────────────────────────────────────────────────────
     public int NumStep = 32;
     public float GuidanceScale = 2.0f;
     public float TShift = 0.1f;
-    public float MaskTemperature = 5.0f;   // 修正拼写 Tempature->Temperature
+    public float MaskTemperature = 5.0f;
     public float TokenTemperature = 1.0f;
 
-    /// <summary>层惩罚系数。原版约为 1.0，C# 旧版 5.0 过强会导致高层完全不解 mask。</summary>
-    public float LayerPenaltyFactor = 1.0f;
+    /// <summary>层惩罚系数。原版约 0.5~1.0；过大会导致高层 codebook 解 mask 过晚，开头音质崩坏。</summary>
+    public float LayerPenaltyFactor = 0.5f;
 
     public OmniVoiceLM(string modelPath, int seed = 42)
     {
@@ -113,17 +114,14 @@ public class OmniVoiceLM : IDisposable
 
             float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
 
-            // ★ 调试：检查 logSoftmax 是否异常
-            if (step == 0 || step == NumStep - 1)
-            {
-                bool hasNaN = logSoftmax.Any(float.IsNaN);
-                bool hasInf = logSoftmax.Any(float.IsInfinity);
-                if (hasNaN || hasInf)
-                    Debug.LogError($"[OmniVoiceLM] 步 {step}: logSoftmax 包含 NaN={hasNaN} Inf={hasInf}！请检查 ONNX 输入（如文本 token ID 越界或 EP 兼容性）");
-            }
-
-            DiffusionStep(inputIds, logSoftmax, genStart, targetLen, S, kNew);
+            // ★ 最后 2 步取消 temperature，直接贪心解 mask，避免开头随机错误
+            bool isFinalSteps = (step >= NumStep - 2);
+            DiffusionStep(inputIds, logSoftmax, genStart, targetLen, S, kNew, isFinalSteps);
         }
+
+        // ★★★ 关键修复：最终强制解 mask ★★★
+        // 循环结束后，所有仍是 MASK 的位置强制用 argmax 填充，避免残余 MASK 被硬填 0 导致开头爆音
+        FinalUnmaskAll(inputIds, audioMask, attnMask, posIds, genStart, targetLen, S);
 
         // 提取结果
         var result = new long[NUM_CODEBOOKS, targetLen];
@@ -133,7 +131,8 @@ public class OmniVoiceLM : IDisposable
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
             {
                 long v = inputIds[0, cb, s];
-                result[cb, t] = v == MASK_TOKEN ? 0 : Math.Clamp(v, 0, MASK_TOKEN - 1);
+                // 此时不应再有 MASK，但做最后一道防护
+                result[cb, t] = (v == MASK_TOKEN) ? 0 : Math.Clamp(v, 0, MASK_TOKEN - 1);
             }
         }
 
@@ -142,7 +141,11 @@ public class OmniVoiceLM : IDisposable
         return result;
     }
 
-    void DiffusionStep(long[,,] inputIds, float[] logSoftmax, int genStart, int targetLen, int S, int kNew)
+    // ════════════════════════════════════════════════════════════════════════
+    // 扩散单步：解 mask
+    // ════════════════════════════════════════════════════════════════════════
+
+    void DiffusionStep(long[,,] inputIds, float[] logSoftmax, int genStart, int targetLen, int S, int kNew, bool greedy = false)
     {
         int stride_CB = S * VOCAB_SIZE;
         var masked = new List<(int t, int cb, float conf)>(targetLen * NUM_CODEBOOKS);
@@ -163,12 +166,9 @@ public class OmniVoiceLM : IDisposable
                 }
 
                 if (float.IsNaN(bestLogP))
-                {
-                    // 若 logits 异常，赋予随机 confidence 避免全选 0
                     bestLogP = -10f + (float)_rng.NextDouble();
-                }
 
-                // ★ 修复：LayerPenalty 改为 1.0 * cb，原版约 0.5~1.0，旧版 5.0 过强
+                // 层惩罚：0.5 * cb，温和惩罚，避免高层完全不解 mask
                 float conf = bestLogP - LayerPenaltyFactor * cb;
                 masked.Add((t, cb, conf));
             }
@@ -178,13 +178,26 @@ public class OmniVoiceLM : IDisposable
 
         kNew = Math.Min(kNew, masked.Count);
         var scored = new (int t, int cb, float score)[masked.Count];
-        for (int i = 0; i < masked.Count; i++)
+
+        if (greedy)
         {
-            var (t, cb, conf) = masked[i];
-            double u = Math.Max(1e-10, _rng.NextDouble());
-            double gumbel = -Math.Log(-Math.Log(u));
-            float score = conf / MaskTemperature + (float)gumbel;
-            scored[i] = (t, cb, score);
+            // 贪心：直接按 confidence 排序，不加 Gumbel 噪声
+            for (int i = 0; i < masked.Count; i++)
+            {
+                var (t, cb, conf) = masked[i];
+                scored[i] = (t, cb, conf);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < masked.Count; i++)
+            {
+                var (t, cb, conf) = masked[i];
+                double u = Math.Max(1e-10, _rng.NextDouble());
+                double gumbel = -Math.Log(-Math.Log(u));
+                float score = conf / MaskTemperature + (float)gumbel;
+                scored[i] = (t, cb, score);
+            }
         }
 
         Array.Sort(scored, (a, b) => b.score.CompareTo(a.score));
@@ -204,6 +217,47 @@ public class OmniVoiceLM : IDisposable
             }
 
             inputIds[0, cb, s] = bestTok;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 最终强制解 mask：所有残余 MASK 位置强制 argmax
+    // ════════════════════════════════════════════════════════════════════════
+
+    void FinalUnmaskAll(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds, int genStart, int targetLen, int S)
+    {
+        // 检查是否还有 MASK 残余
+        int maskCount = 0;
+        for (int t = 0; t < targetLen; t++)
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                if (inputIds[0, cb, genStart + t] == MASK_TOKEN)
+                    maskCount++;
+
+        if (maskCount == 0) return;
+
+        Debug.Log($"[OmniVoiceLM] 最终强制解 mask: 残余 {maskCount} 个 MASK 位置");
+
+        // 重新前向一次获取最新 logits（不带 CFG 也可，这里复用已有逻辑）
+        float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
+
+        int stride_CB = S * VOCAB_SIZE;
+        for (int t = 0; t < targetLen; t++)
+        {
+            int s = genStart + t;
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+            {
+                if (inputIds[0, cb, s] != MASK_TOKEN) continue;
+
+                float bestLogP = float.NegativeInfinity;
+                long bestTok = 0;
+                for (int v = 0; v < VOCAB_SIZE - 1; v++)
+                {
+                    float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
+                    if (float.IsNaN(lp)) { bestTok = 0; bestLogP = 0; break; }
+                    if (lp > bestLogP) { bestLogP = lp; bestTok = v; }
+                }
+                inputIds[0, cb, s] = bestTok;
+            }
         }
     }
 

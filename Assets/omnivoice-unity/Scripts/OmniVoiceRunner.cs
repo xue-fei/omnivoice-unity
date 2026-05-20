@@ -4,14 +4,15 @@ using System.Collections;
 using UnityEngine;
 
 /// <summary>
-/// OmniVoice Unity Runner（扩散 LM 正确流程）
+/// OmniVoice Unity Runner — 正确的扩散 LM 流程
 ///
-/// ★ 修正要点（对比旧版）：
-///   1. 接入 Qwen2Tokenizer 构建文本 prompt tokens（语言 + 文本标记）
-///   2. 使用 OmniVoiceLM.NumStep 迭代扩散，而非逐 token 自回归
-///   3. GuidanceScale 默认 2.0（Python 版默认值）
-///   4. targetLen 由文本长度估算（不依赖参考音频长度）
-///   5. 支持独立指定生成时长
+/// 完整流程：
+///   1. 用 Qwen2Tokenizer 把文本构建成 prompt tokens
+///   2. 用 AudioTokenizer.Encode 把参考音频转为 codes
+///   3. 估算目标生成帧数（按文字长度 + RuleDurationEstimator 简化版）
+///   4. 调用 OmniVoiceLM.Generate 做扩散迭代（在后台线程）
+///   5. 用 AudioTokenizer.Decode 把 codes 转回 PCM
+///   6. 后处理（音量归一化、淡入淡出）并播放/保存
 /// </summary>
 public class OmniVoiceRunner : MonoBehaviour
 {
@@ -20,8 +21,7 @@ public class OmniVoiceRunner : MonoBehaviour
 
     [TextArea]
     public string targetText = "你好，这是使用语音克隆生成的音频。";
-
-    public string targetLanguage = "Chinese";   // "Chinese" or "English"
+    public string targetLanguage = "Chinese";   // "Chinese" 或 "English"
 
     public AudioSource outputAudioSource;
 
@@ -31,26 +31,29 @@ public class OmniVoiceRunner : MonoBehaviour
     public string decModelRelPath = "OmniVoice/audio_tokenizer_decoder_int8/model.onnx";
     public string tokenizerJsonRelPath = "OmniVoice/tokenizer.json";
 
-    [Header("生成参数（与 Python 版对齐）")]
-    [Tooltip("扩散迭代步数。32 是原版默认值，越小越快质量越低。")]
+    [Header("生成参数（与原版 Python 对齐）")]
+    [Tooltip("扩散步数，原版默认 32；速度优先可降至 16")]
     public int numStep = 32;
 
-    [Tooltip("CFG 引导强度。原版默认 2.0，设 0 关闭。")]
+    [Tooltip("CFG 引导强度，原版默认 2.0")]
     public float guidanceScale = 2.0f;
 
-    [Tooltip("扩散调度 t_shift，原版默认 0.1。")]
+    [Tooltip("调度时移 τ，原版默认 0.1")]
     public float tShift = 0.1f;
 
-    [Tooltip("TopK 采样。原版默认 50。")]
-    public int topK = 50;
+    [Tooltip("mask 位置选择温度，原版默认 5.0")]
+    public float maskTemperature = 5.0f;
 
-    [Tooltip("每帧生成目标时长(秒)。0 = 按参考音频长度自动估算。")]
+    [Tooltip("层惩罚系数，原版默认 5.0")]
+    public float layerPenaltyFactor = 5.0f;
+
+    [Tooltip("目标生成时长（秒）。0 = 按文字长度自动估算")]
     public float targetDurSec = 0f;
 
     // ─── 内部字段 ────────────────────────────────────────────────────────────
     OmniVoiceLM _lm;
     AudioTokenizer _tokenizer;
-    Qwen2Tokenizer _textTokenizer;
+    Qwen2Tokenizer _textTok;
     bool _isGenerating;
 
     // ════════════════════════════════════════════════════════════════════════
@@ -64,34 +67,30 @@ public class OmniVoiceRunner : MonoBehaviour
         string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
         string tokPath = Path.Combine(Application.streamingAssetsPath, tokenizerJsonRelPath);
 
-        // LM
         _lm = new OmniVoiceLM(lmPath)
         {
             NumStep = numStep,
             GuidanceScale = guidanceScale,
             TShift = tShift,
-            TopK = topK,
-            Temperature = 1.0f,
+            MaskTempature = maskTemperature,
+            LayerPenaltyFactor = layerPenaltyFactor,
         };
 
-        // 音频 codec
         _tokenizer = new AudioTokenizer(encPath, decPath);
 
-        // 文本 tokenizer（如不存在则回退为空 prompt）
         if (File.Exists(tokPath))
         {
-            _textTokenizer = Qwen2Tokenizer.Load(tokPath);
+            _textTok = Qwen2Tokenizer.Load(tokPath);
             Debug.Log("[OmniVoiceRunner] 文本 Tokenizer 已加载");
         }
         else
         {
-            Debug.LogWarning($"[OmniVoiceRunner] 未找到 tokenizer.json: {tokPath}，将以空文本 prompt 运行（音质可能下降）");
+            Debug.LogWarning($"[OmniVoiceRunner] 未找到 tokenizer.json ({tokPath})，将以空文本 prompt 运行");
         }
 
-        Debug.Log("[OmniVoiceRunner] 所有模型加载完成");
+        Debug.Log("[OmniVoiceRunner] 初始化完成");
     }
 
-    // 外部调用入口（如 UI Button.OnClick）
     public void CloneVoice() => StartCoroutine(CloneVoiceCoroutine());
 
     void OnDestroy()
@@ -101,20 +100,15 @@ public class OmniVoiceRunner : MonoBehaviour
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // 语音克隆主协程
+    // 生成主协程
     // ════════════════════════════════════════════════════════════════════════
 
     IEnumerator CloneVoiceCoroutine()
     {
-        if (_isGenerating)
-        {
-            Debug.LogWarning("[OmniVoiceRunner] 上一次生成仍在进行，请等待");
-            yield break;
-        }
+        if (_isGenerating) { Debug.LogWarning("上一次生成仍在进行"); yield break; }
         _isGenerating = true;
-
-        Debug.Log("[OmniVoiceRunner] ▶ 开始语音克隆...");
         float t0 = Time.realtimeSinceStartup;
+        Debug.Log("[OmniVoiceRunner] ▶ 开始...");
 
         // ── 步骤 1：编码参考音频 ─────────────────────────────────────────
         long[,] refCodes = null;
@@ -123,62 +117,42 @@ public class OmniVoiceRunner : MonoBehaviour
         if (referenceAudio != null)
         {
             float[] refPCM = AudioUtils.AudioClipToPCM(referenceAudio);
+            // 参考音频建议 3-10 秒（过长会降质）
             refCodes = _tokenizer.Encode(refPCM);
             T_ref = refCodes.GetLength(1);
-            Debug.Log($"[OmniVoiceRunner] 参考音频 codes: [8, {T_ref}] ({T_ref * 960f / 24000f:F1}s)");
+            float refDur = T_ref * 960f / 24000f;
+            Debug.Log($"[OmniVoiceRunner] 参考音频: {refDur:F1}s ({T_ref} 帧)");
+            if (refDur < 2f) Debug.LogWarning("参考音频过短（< 2s），克隆质量可能较差");
+            if (refDur > 15f) Debug.LogWarning("参考音频较长（> 15s），建议裁剪至 3-10s");
         }
 
-        // ── 步骤 2：构建文本 prompt tokens ──────────────────────────────
+        // ── 步骤 2：构建文本 prompt ──────────────────────────────────────
         int[] textTokenIds;
-        if (_textTokenizer != null && !string.IsNullOrEmpty(targetText))
+        if (_textTok != null && !string.IsNullOrEmpty(targetText))
         {
-            // BuildPrompt 输出格式：<|denoise|> <|lang_start|> Chinese <|lang_end|> <|text_start|> 文字 <|text_end|>
-            textTokenIds = _textTokenizer.BuildPrompt(targetText, targetLanguage);
+            // BuildPrompt 格式（来自 Qwen2Tokenizer.cs）：
+            //   <|denoise|> <|lang_start|> {language} <|lang_end|>
+            //   <|text_start|> {text} <|text_end|>
+            textTokenIds = _textTok.BuildPrompt(targetText, targetLanguage);
             Debug.Log($"[OmniVoiceRunner] 文本 prompt: {textTokenIds.Length} tokens");
         }
         else
         {
-            // audio-only 模式（无文本条件）
             textTokenIds = Array.Empty<int>();
-            Debug.LogWarning("[OmniVoiceRunner] 以 audio-only 模式运行（无文本 tokenizer）");
         }
 
-        // ── 步骤 3：确定目标生成帧数 ────────────────────────────────────
-        int targetLen;
-        if (targetDurSec > 0f)
-        {
-            // 用户指定时长
-            targetLen = Mathf.RoundToInt(targetDurSec * 24000f / 960f);
-        }
-        else if (T_ref > 0)
-        {
-            // 按参考音频长度（语音克隆常见策略）
-            // 同时参考文本长度做比例缩放（文字越多，生成越长）
-            float textLenFactor = textTokenIds.Length > 0
-                ? Mathf.Clamp((float)targetText.Length / 10f, 0.5f, 5f)
-                : 1f;
-            targetLen = Mathf.RoundToInt(T_ref * textLenFactor);
-            targetLen = Mathf.Clamp(targetLen, 25, 500);  // 约 1s ~ 20s
-        }
-        else
-        {
-            // 无参考音频时，按文字长度粗估（每个中文字约 10 帧）
-            targetLen = Mathf.Max(50, targetText.Length * 10);
-        }
+        // ── 步骤 3：估算目标生成帧数 ────────────────────────────────────
+        int targetLen = EstimateTargetLen(targetText, targetLanguage, T_ref);
+        Debug.Log($"[OmniVoiceRunner] 目标帧数: {targetLen} ({targetLen * 960f / 24000f:F1}s)");
 
-        Debug.Log($"[OmniVoiceRunner] 目标生成: {targetLen} 帧 ({targetLen * 960f / 24000f:F1}s)");
-
-        // ── 步骤 4：扩散 LM 生成（后台线程）────────────────────────────
+        // ── 步骤 4：扩散 LM 生成（后台线程） ────────────────────────────
         long[,] generatedCodes = null;
         bool done = false;
         Exception err = null;
 
         System.Threading.ThreadPool.QueueUserWorkItem(_ =>
         {
-            try
-            {
-                generatedCodes = _lm.Generate(textTokenIds, refCodes, targetLen);
-            }
+            try { generatedCodes = _lm.Generate(textTokenIds, refCodes, targetLen); }
             catch (Exception e) { err = e; }
             finally { done = true; }
         });
@@ -187,7 +161,7 @@ public class OmniVoiceRunner : MonoBehaviour
 
         if (err != null)
         {
-            Debug.LogError($"[OmniVoiceLM] 生成失败:\n{err}");
+            Debug.LogError($"[OmniVoiceLM] 生成异常:\n{err}");
             _isGenerating = false;
             yield break;
         }
@@ -200,28 +174,66 @@ public class OmniVoiceRunner : MonoBehaviour
         }
 
         // ── 步骤 5：解码 codes → PCM ────────────────────────────────────
-        float[] outputPCM = _tokenizer.Decode(generatedCodes);
+        float[] pcm = _tokenizer.Decode(generatedCodes);
 
-        // 音频后处理
-        AudioUtils.NormalizeRMS(outputPCM);
-        AudioUtils.ApplyFade(outputPCM);
+        // ── 步骤 6：后处理 ───────────────────────────────────────────────
+        AudioUtils.NormalizeRMS(pcm);
+        AudioUtils.ApplyFade(pcm);
 
-        // ── 步骤 6：播放 + 保存 ─────────────────────────────────────────
         float elapsed = Time.realtimeSinceStartup - t0;
-        float audioDur = outputPCM.Length / 24000f;
+        float audioDur = pcm.Length / 24000f;
         Debug.Log($"[OmniVoiceRunner] ✅ 完成: 音频={audioDur:F1}s 耗时={elapsed:F1}s RTF={elapsed / audioDur:F2}");
 
-        var clip = AudioUtils.PCMToAudioClip(outputPCM, "omnivoice_output");
-        if (outputAudioSource != null)
-        {
-            outputAudioSource.clip = clip;
-            outputAudioSource.Play();
-        }
+        // 播放
+        var clip = AudioUtils.PCMToAudioClip(pcm, "omnivoice_output");
+        if (outputAudioSource != null) { outputAudioSource.clip = clip; outputAudioSource.Play(); }
 
+        // 保存
         string savePath = Path.Combine(Application.dataPath, "omnivoice_output.wav");
-        AudioUtils.SaveWav(savePath, outputPCM);
-        Debug.Log($"[OmniVoiceRunner] 已保存: {savePath}");
+        AudioUtils.SaveWav(savePath, pcm);
+        Debug.Log($"[OmniVoiceRunner] 已保存至: {savePath}");
 
         _isGenerating = false;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 目标帧数估算（简化版 RuleDurationEstimator）
+    // ════════════════════════════════════════════════════════════════════════
+
+    int EstimateTargetLen(string text, string language, int T_ref)
+    {
+        if (targetDurSec > 0f)
+            return Mathf.RoundToInt(targetDurSec * 24000f / 960f);
+
+        if (string.IsNullOrEmpty(text))
+            return T_ref > 0 ? T_ref : 100;
+
+        // 粗估：中文每字约 0.22s（~5.5帧），英文每词约 0.4s（~10帧）
+        // （参考原版 RuleDurationEstimator，比率相近）
+        bool isChinese = language.IndexOf("Chinese", StringComparison.OrdinalIgnoreCase) >= 0;
+        float durSec;
+        if (isChinese)
+        {
+            // 中文：计字符数（去掉标点），每字 ~0.22s
+            int charCount = 0;
+            foreach (char c in text)
+                if (!char.IsPunctuation(c) && !char.IsWhiteSpace(c)) charCount++;
+            durSec = charCount * 0.22f;
+        }
+        else
+        {
+            // 英文：按空格拆词，每词 ~0.4s
+            int wordCount = text.Split(new[] { ' ', '\t', '\n' }, StringSplitOptions.RemoveEmptyEntries).Length;
+            durSec = wordCount * 0.4f;
+        }
+
+        durSec = Mathf.Clamp(durSec, 1.0f, 30.0f);
+        int frames = Mathf.RoundToInt(durSec * 24000f / 960f);
+
+        // 若有参考音频，以参考帧数为上界（避免生成远超参考的奇怪音频）
+        if (T_ref > 0)
+            frames = Mathf.Min(frames, T_ref * 3);
+
+        return Mathf.Max(frames, 25);
     }
 }

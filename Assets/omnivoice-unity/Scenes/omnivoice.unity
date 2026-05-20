@@ -292,13 +292,18 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   referenceAudio: {fileID: 8300000, guid: 5e8aa31b2039fb74caa482c53d51b674, type: 3}
   targetText: "\u4F60\u597D\uFF0C\u8FD9\u662F\u4F7F\u7528\u8BED\u97F3\u514B\u9686\u751F\u6210\u7684\u97F3\u9891\u3002"
+  targetLanguage: Chinese
   outputAudioSource: {fileID: 384914473}
   lmModelRelPath: OmniVoice/omnivoice_lm_int8_hq/model.onnx
   encModelRelPath: OmniVoice/audio_tokenizer_encoder_int8/model.onnx
   decModelRelPath: OmniVoice/audio_tokenizer_decoder_int8/model.onnx
+  tokenizerJsonRelPath: OmniVoice/tokenizer.json
+  numStep: 32
   guidanceScale: 0
-  topK: 50
-  maxNewTokens: 200
+  tShift: 0.1
+  maskTemperature: 5
+  layerPenaltyFactor: 5
+  targetDurSec: 0
 --- !u!82 &384914473
 AudioSource:
   m_ObjectHideFlags: 0

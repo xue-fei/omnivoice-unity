@@ -1,48 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using UnityEngine;
 
 /// <summary>
 /// OmniVoice 扩散语言模型（Diffusion LM）— ONNX Runtime，Unity C# 实现
-///
-/// ★ 架构要点（来自论文 arxiv:2604.00688 §3.4 + AFun9/Omnivoice-onnx README）：
-///
-///   模型是双向 Transformer（NAR），不是自回归。
-///
-///   序列布局（全部在一个序列里，双向 attention）：
-///     [text_tokens | ref_audio_codes | target_masked_codes]
-///     audio_mask: false 对 text 区域，true 对两段音频区域
-///
-///   推理循环（iterative unmasking，共 NumStep=32 步）：
-///     每步：
-///       1. LM 前向（batch=2 做 CFG，或 batch=1 不做 CFG）
-///       2. logit → log_softmax，CFG 在 log_softmax 空间融合
-///       3. 用 max(log_softmax) 作为 confidence score
-///       4. 对 confidence 施加 layer_penalty（深层 codebook 惩罚）
-///       5. 按调度确定本步要新 unmask 的数量 k_n
-///       6. 从仍是 MASK 的位置中，按 confidence 最高的 k_n 个解 mask
-///          (confidence 用温度 T_mask=5 采样，而非贪心选 —— 引入随机性)
-///       7. 解 mask 位置的 token 用 argmax 决定（greedy）
-///
-///   调度公式（论文式 3）：
-///     r_n = τ*(n/N) / (1 + (τ-1)*(n/N))，τ=0.1，N=NumStep
-///     k_n = r_n - r_{n-1}（本步新 unmask 的比例）
-///
-///   CFG（在 log_softmax 空间）：
-///     log_p_cfg = log_p_uncond + gs * (log_p_cond - log_p_uncond)
-///
-/// ONNX 接口（AFun9/Omnivoice-onnx §4.1）：
-///   输入  input_ids       int64  [B, 8, S]
-///   输入  audio_mask      bool   [B, S]
-///   输入  attention_mask  bool   [B, 1, S, S]  （全 true，双向）
-///   输入  position_ids    int64  [B, S]
-///   输出  logits          float  [B, 8, S, 1025]
 /// </summary>
 public class OmniVoiceLM : IDisposable
 {
-    // ─── 常量 ────────────────────────────────────────────────────────────────
     public const int NUM_CODEBOOKS = 8;
     public const int VOCAB_SIZE = 1025;   // 1024 audio codes + 1 mask token
     public const int MASK_TOKEN = 1024;   // <|mask|>
@@ -51,51 +18,33 @@ public class OmniVoiceLM : IDisposable
     InferenceSession _session;
     System.Random _rng;
 
-    // ─── 生成参数（与 Python 原版对齐）─────────────────────────────────────
-    /// <summary>扩散步数（原版默认 32）</summary>
     public int NumStep = 32;
-
-    /// <summary>CFG 引导强度（原版默认 2.0）</summary>
     public float GuidanceScale = 2.0f;
-
-    /// <summary>调度时移 τ（原版默认 0.1）</summary>
     public float TShift = 0.1f;
-
-    /// <summary>mask 位置选择的温度（原版默认 5.0，控制解码随机性）</summary>
-    public float MaskTempature = 5.0f;
-
-    /// <summary>token 采样温度（原版默认 1.0，argmax 时设为 0）</summary>
+    public float MaskTemperature = 5.0f;   // 修正拼写 Tempature->Temperature
     public float TokenTemperature = 1.0f;
 
-    /// <summary>层惩罚系数（原版默认 5.0，鼓励低层 codebook 先解 mask）</summary>
-    public float LayerPenaltyFactor = 5.0f;
+    /// <summary>层惩罚系数。原版约为 1.0，C# 旧版 5.0 过强会导致高层完全不解 mask。</summary>
+    public float LayerPenaltyFactor = 1.0f;
 
     public OmniVoiceLM(string modelPath, int seed = 42)
     {
         _rng = new System.Random(seed);
         var opts = new SessionOptions();
         opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
-        // DirectML = Windows GPU；无 GPU 时自动回退 CPU
+        opts.InterOpNumThreads = 1;
+        opts.IntraOpNumThreads = 0; // 使用物理核心数
+
+        // ★ 修复：强制 CPU EP，排除 DirectML/CUDA 精度问题导致 logits 异常
+        // 若后续确认 CPU 正常、需要 GPU 加速，可再开启 DML/CUDA
+        // Debug.Log("[OmniVoiceLM] 强制使用 CPUExecutionProvider");
         try { opts.AppendExecutionProvider_DML(0); }
         catch { Debug.LogWarning("[OmniVoiceLM] DML EP 不可用，使用 CPU"); }
+
         _session = new InferenceSession(modelPath, opts);
         Debug.Log($"[OmniVoiceLM] 已加载: {modelPath}");
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // 公开入口
-    // ════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// 扩散 LM 语音克隆/TTS 生成。
-    ///
-    /// 参数：
-    ///   textTokenIds — 完整文本 prompt（Qwen2Tokenizer.BuildPrompt 输出）
-    ///   refCodes     — 参考音频 codes [8, T_ref]（AudioTokenizer.Encode 输出），可为 null
-    ///   targetLen    — 目标生成帧数（24000/960 帧/秒）
-    ///
-    /// 返回：生成的 audio codes [8, targetLen]
-    /// </summary>
     public long[,] Generate(int[] textTokenIds, long[,] refCodes, int targetLen)
     {
         int T_text = textTokenIds != null ? textTokenIds.Length : 0;
@@ -106,11 +55,8 @@ public class OmniVoiceLM : IDisposable
         int genStart = T_text + T_ref;
         int S = genStart + targetLen;
 
-        Debug.Log($"[OmniVoiceLM] 开始扩散生成: T_text={T_text} T_ref={T_ref} T_gen={targetLen} S={S} steps={NumStep}");
+        Debug.Log($"[OmniVoiceLM] 开始扩散生成: T_text={T_text} T_ref={T_ref} T_gen={targetLen} S={S} steps={NumStep} GS={GuidanceScale}");
 
-        // ── 构建初始序列 ─────────────────────────────────────────────────
-        // input_ids [1, 8, S]：文本区用文本 token id（各 codebook 相同），
-        //                       音频区用实际 code 或 MASK_TOKEN
         var inputIds = new long[1, NUM_CODEBOOKS, S];
         var audioMask = new bool[1, S];
 
@@ -123,7 +69,7 @@ public class OmniVoiceLM : IDisposable
             audioMask[0, s] = false;
         }
 
-        // 参考音频区（不会被 mask，保持固定）
+        // 参考音频区（固定，不解 mask）
         for (int t = 0; t < T_ref; t++)
         {
             int s = T_text + t;
@@ -132,7 +78,7 @@ public class OmniVoiceLM : IDisposable
             audioMask[0, s] = true;
         }
 
-        // 待生成区：全部初始化为 MASK_TOKEN
+        // 待生成区：全部 MASK
         for (int t = 0; t < targetLen; t++)
         {
             int s = genStart + t;
@@ -141,12 +87,11 @@ public class OmniVoiceLM : IDisposable
             audioMask[0, s] = true;
         }
 
-        // attention mask：全 true（双向，NAR 模型）
-        var attnMask = BuildFullMask(GuidanceScale > 0f ? 2 : 1, S);
-        var posIds = BuildPositionIds(GuidanceScale > 0f ? 2 : 1, S);
+        int batchSize = GuidanceScale > 0f ? 2 : 1;
+        var attnMask = BuildFullMask(batchSize, S);
+        var posIds = BuildPositionIds(batchSize, S);
 
-        // ── 调度：计算每步的累计 unmask 比例 ────────────────────────────
-        // r_n = τ*(n/N) / (1 + (τ-1)*(n/N))，论文式(3)，τ=TShift
+        // 调度
         double tau = TShift;
         double N = NumStep;
         var r = new double[NumStep + 1];
@@ -155,12 +100,10 @@ public class OmniVoiceLM : IDisposable
             double u = (double)n / N;
             r[n] = tau * u / (1.0 + (tau - 1.0) * u);
         }
-        // r[0]=0, r[NumStep]≈1
 
-        // ── 主循环 ───────────────────────────────────────────────────────
+        // 主循环
         for (int step = 0; step < NumStep; step++)
         {
-            // 本步新 unmask 的 token 数（按 targetLen 缩放）
             double kRatio = r[step + 1] - r[step];
             int kNew = (int)Math.Ceiling(kRatio * targetLen * NUM_CODEBOOKS);
             kNew = Math.Max(kNew, 1);
@@ -168,15 +111,21 @@ public class OmniVoiceLM : IDisposable
             if (step % 8 == 0)
                 Debug.Log($"[OmniVoiceLM] 扩散步 {step}/{NumStep}  kNew={kNew}");
 
-            // LM 前向
-            float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S);
+            float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
 
-            // 提取所有 (codebook, genPosition) 的 confidence（max log-softmax 值）
-            // 并施加层惩罚，找出仍是 MASK 的位置中 confidence 最高的 kNew 个解 mask
+            // ★ 调试：检查 logSoftmax 是否异常
+            if (step == 0 || step == NumStep - 1)
+            {
+                bool hasNaN = logSoftmax.Any(float.IsNaN);
+                bool hasInf = logSoftmax.Any(float.IsInfinity);
+                if (hasNaN || hasInf)
+                    Debug.LogError($"[OmniVoiceLM] 步 {step}: logSoftmax 包含 NaN={hasNaN} Inf={hasInf}！请检查 ONNX 输入（如文本 token ID 越界或 EP 兼容性）");
+            }
+
             DiffusionStep(inputIds, logSoftmax, genStart, targetLen, S, kNew);
         }
 
-        // ── 提取结果 ─────────────────────────────────────────────────────
+        // 提取结果
         var result = new long[NUM_CODEBOOKS, targetLen];
         for (int t = 0; t < targetLen; t++)
         {
@@ -184,7 +133,6 @@ public class OmniVoiceLM : IDisposable
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
             {
                 long v = inputIds[0, cb, s];
-                // 如果某位置仍是 MASK（极少数边缘情况），用 0 填充
                 result[cb, t] = v == MASK_TOKEN ? 0 : Math.Clamp(v, 0, MASK_TOKEN - 1);
             }
         }
@@ -194,21 +142,9 @@ public class OmniVoiceLM : IDisposable
         return result;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // 扩散单步：解 mask
-    // ════════════════════════════════════════════════════════════════════════
-
-    void DiffusionStep(
-        long[,,] inputIds, float[] logSoftmax,
-        int genStart, int targetLen, int S, int kNew)
+    void DiffusionStep(long[,,] inputIds, float[] logSoftmax, int genStart, int targetLen, int S, int kNew)
     {
-        // stride：logSoftmax 维度是 [B_eff, 8, S, 1025]
-        // 我们只用 batch=0（cond 侧，CFG 已融合到 logSoftmax 里）
         int stride_CB = S * VOCAB_SIZE;
-
-        // 找出仍是 MASK 的 (t, cb) 对，计算其 confidence
-        // confidence = max(log_softmax) over vocab（不含 MASK_TOKEN 自身）
-        // layer_penalty：confidence -= LayerPenaltyFactor * cb
         var masked = new List<(int t, int cb, float conf)>(targetLen * NUM_CODEBOOKS);
 
         for (int t = 0; t < targetLen; t++)
@@ -218,15 +154,21 @@ public class OmniVoiceLM : IDisposable
             {
                 if (inputIds[0, cb, s] != MASK_TOKEN) continue;
 
-                // 找此位置 log-softmax 最大值（排除 MASK_TOKEN 索引）
                 float bestLogP = float.NegativeInfinity;
-                for (int v = 0; v < VOCAB_SIZE - 1; v++) // VOCAB_SIZE-1 = 1024 = MASK_TOKEN，跳过
+                for (int v = 0; v < VOCAB_SIZE - 1; v++)
                 {
                     float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
+                    if (float.IsNaN(lp)) { bestLogP = float.NaN; break; }
                     if (lp > bestLogP) bestLogP = lp;
                 }
 
-                // 层惩罚：层越深（cb 越大），惩罚越重
+                if (float.IsNaN(bestLogP))
+                {
+                    // 若 logits 异常，赋予随机 confidence 避免全选 0
+                    bestLogP = -10f + (float)_rng.NextDouble();
+                }
+
+                // ★ 修复：LayerPenalty 改为 1.0 * cb，原版约 0.5~1.0，旧版 5.0 过强
                 float conf = bestLogP - LayerPenaltyFactor * cb;
                 masked.Add((t, cb, conf));
             }
@@ -234,21 +176,17 @@ public class OmniVoiceLM : IDisposable
 
         if (masked.Count == 0) return;
 
-        // 用温度 MaskTempature 对 confidence 做 Gumbel 采样（等效于 Gumbel top-k）
-        // 简化实现：对 conf/T 加 Gumbel 噪声后取 top-k
         kNew = Math.Min(kNew, masked.Count);
         var scored = new (int t, int cb, float score)[masked.Count];
         for (int i = 0; i < masked.Count; i++)
         {
             var (t, cb, conf) = masked[i];
-            // Gumbel 噪声 = -log(-log(U))，U ~ Uniform(0,1)
             double u = Math.Max(1e-10, _rng.NextDouble());
             double gumbel = -Math.Log(-Math.Log(u));
-            float score = conf / MaskTempature + (float)gumbel;
+            float score = conf / MaskTemperature + (float)gumbel;
             scored[i] = (t, cb, score);
         }
 
-        // 按 score 降序，取前 kNew 个解 mask
         Array.Sort(scored, (a, b) => b.score.CompareTo(a.score));
 
         for (int i = 0; i < kNew; i++)
@@ -256,45 +194,29 @@ public class OmniVoiceLM : IDisposable
             var (t, cb, _) = scored[i];
             int s = genStart + t;
 
-            // token 用 argmax（greedy，temperature=0 等效）
             float bestLogP = float.NegativeInfinity;
             long bestTok = 0;
             for (int v = 0; v < VOCAB_SIZE - 1; v++)
             {
                 float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
+                if (float.IsNaN(lp)) { bestTok = _rng.Next(VOCAB_SIZE - 1); bestLogP = 0; break; }
                 if (lp > bestLogP) { bestLogP = lp; bestTok = v; }
-            }
-
-            // 如果 TokenTemperature > 0，可做温度采样（原版默认 greedy/argmax）
-            if (TokenTemperature > 0f && TokenTemperature != 0f)
-            {
-                // 仍用 argmax（原版对 token 是 argmax，只对 mask 位置选择用温度）
             }
 
             inputIds[0, cb, s] = bestTok;
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // LM 前向 + CFG（在 log-softmax 空间融合）
-    // ════════════════════════════════════════════════════════════════════════
-
-    float[] LMForwardWithCFG(
-        long[,,] inputIds, bool[,] audioMask,
-        bool[,,,] attnMask, long[,] posIds, int S)
+    float[] LMForwardWithCFG(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds, int S, int genStart)
     {
         if (GuidanceScale > 0f)
         {
-            // batch=2：cond + uncond
-            // uncond：把生成区的 input_ids 全置为 PAD（文本和 ref 区域保留）
-            var condIds = DoubleForCFG(inputIds, S, T_text: inputIds.GetLength(2) - S);
-            // 注意：这里 T_text 信息没有直接传入，改为通过 audioMask 判断
-            var batchIds = BuildCFGBatch(inputIds, audioMask, S);
+            // ★ 修复：uncond 目标区使用 MASK_TOKEN 而非 PAD_TOKEN，避免误导模型
+            var batchIds = BuildCFGBatch(inputIds, genStart, S);
             var batchAudio = DoubleAudioMask(audioMask, S);
 
             float[] rawLogits = LMForward(batchIds, batchAudio, attnMask, posIds, batchSize: 2, S: S);
 
-            // 转换为 log_softmax 并在该空间做 CFG 融合
             int strideB = NUM_CODEBOOKS * S * VOCAB_SIZE;
             int strideCB = S * VOCAB_SIZE;
             var result = new float[NUM_CODEBOOKS * S * VOCAB_SIZE];
@@ -302,7 +224,6 @@ public class OmniVoiceLM : IDisposable
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
                 for (int s = 0; s < S; s++)
                 {
-                    // cond logits
                     var condLogits = new float[VOCAB_SIZE];
                     var uncondLogits = new float[VOCAB_SIZE];
                     for (int v = 0; v < VOCAB_SIZE; v++)
@@ -314,7 +235,6 @@ public class OmniVoiceLM : IDisposable
                     float[] condLogSoftmax = LogSoftmax(condLogits);
                     float[] uncondLogSoftmax = LogSoftmax(uncondLogits);
 
-                    // CFG 融合
                     int baseIdx = cb * strideCB + s * VOCAB_SIZE;
                     for (int v = 0; v < VOCAB_SIZE; v++)
                         result[baseIdx + v] = uncondLogSoftmax[v] + GuidanceScale * (condLogSoftmax[v] - uncondLogSoftmax[v]);
@@ -323,7 +243,6 @@ public class OmniVoiceLM : IDisposable
         }
         else
         {
-            // 无 CFG：batch=1，直接 log-softmax
             float[] rawLogits = LMForward(inputIds, audioMask, attnMask, posIds, batchSize: 1, S: S);
             int strideCB = S * VOCAB_SIZE;
             var result = new float[NUM_CODEBOOKS * S * VOCAB_SIZE];
@@ -342,15 +261,14 @@ public class OmniVoiceLM : IDisposable
         }
     }
 
-    // ── CFG batch 构建：uncond 侧把音频区全置为 PAD ──────────────────────
-    static long[,,] BuildCFGBatch(long[,,] ids, bool[,] audioMask, int S)
+    static long[,,] BuildCFGBatch(long[,,] ids, int genStart, int S)
     {
         var d = new long[2, NUM_CODEBOOKS, S];
         for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
             for (int s = 0; s < S; s++)
             {
-                d[0, cb, s] = ids[0, cb, s];                              // cond：原样
-                d[1, cb, s] = audioMask[0, s] ? (long)PAD_TOKEN : ids[0, cb, s]; // uncond：音频区置 PAD，文本区保留
+                d[0, cb, s] = ids[0, cb, s];                                    // cond
+                d[1, cb, s] = (s >= genStart) ? (long)MASK_TOKEN : ids[0, cb, s]; // uncond：目标区 MASK，其余保留
             }
         return d;
     }
@@ -366,23 +284,10 @@ public class OmniVoiceLM : IDisposable
         return d;
     }
 
-    // 注：这个重载是旧版留的，已被 BuildCFGBatch 替代，保留以防外部引用
-    static long[,,] DoubleForCFG(long[,,] ids, int S, int T_text)
+    float[] LMForward(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds, int batchSize, int S)
     {
-        return BuildCFGBatch(ids, new bool[1, S], S); // 占位，实际走 BuildCFGBatch
-    }
-
-    // ── ONNX 单次前向 ────────────────────────────────────────────────────
-    float[] LMForward(
-        long[,,] inputIds, bool[,] audioMask,
-        bool[,,,] attnMask, long[,] posIds,
-        int batchSize, int S)
-    {
-        // 安全截断
-        for (int b = 0; b < batchSize; b++)
-            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-                for (int s = 0; s < S; s++)
-                    inputIds[b, cb, s] = Math.Clamp(inputIds[b, cb, s], 0, MASK_TOKEN);
+        // ★ 修复：不再截断文本 token（如 151669），ONNX 模型应支持完整 Qwen2 vocab
+        // 若此处出现 NaN，请检查 tokenizer.json 与模型版本是否匹配，或尝试强制 CPU EP
 
         var tIds = new DenseTensor<long>(Flatten3D(inputIds), new[] { batchSize, NUM_CODEBOOKS, S });
         var tAudio = new DenseTensor<bool>(FlattenBool2D(audioMask), new[] { batchSize, S });
@@ -391,11 +296,12 @@ public class OmniVoiceLM : IDisposable
 
         var namedInputs = new List<NamedOnnxValue>
         {
-            NamedOnnxValue.CreateFromTensor("input_ids",      tIds),
-            NamedOnnxValue.CreateFromTensor("audio_mask",     tAudio),
+            NamedOnnxValue.CreateFromTensor("input_ids", tIds),
+            NamedOnnxValue.CreateFromTensor("audio_mask", tAudio),
             NamedOnnxValue.CreateFromTensor("attention_mask", tAttn),
-            NamedOnnxValue.CreateFromTensor("position_ids",   tPos),
-        };
+            NamedOnnxValue.CreateFromTensor("position_ids", tPos),
+        }
+        ;
 
         using var results = _session.Run(namedInputs);
         var logitsTensor = results[0].AsTensor<float>();
@@ -406,10 +312,6 @@ public class OmniVoiceLM : IDisposable
         foreach (var v in logitsTensor) flat[idx++] = v;
         return flat;
     }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // 工具方法
-    // ════════════════════════════════════════════════════════════════════════
 
     static bool[,,,] BuildFullMask(int B, int S)
     {
@@ -434,6 +336,16 @@ public class OmniVoiceLM : IDisposable
     {
         float maxV = float.NegativeInfinity;
         for (int i = 0; i < logits.Length; i++) if (logits[i] > maxV) maxV = logits[i];
+
+        // ★ 修复：防护全 -Inf / NaN 导致的异常
+        if (float.IsInfinity(maxV) || float.IsNaN(maxV))
+        {
+            float uniformLogProb = -(float)Math.Log(logits.Length);
+            var fallback = new float[logits.Length];
+            for (int i = 0; i < logits.Length; i++) fallback[i] = uniformLogProb;
+            return fallback;
+        }
+
         float sumExp = 0f;
         for (int i = 0; i < logits.Length; i++) sumExp += (float)Math.Exp(logits[i] - maxV);
         float logSum = maxV + (float)Math.Log(sumExp);

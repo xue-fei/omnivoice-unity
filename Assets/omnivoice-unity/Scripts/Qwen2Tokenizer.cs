@@ -2,25 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEngine;
 
-/// <summary>
-/// Qwen2 BPE Tokenizer — 在 Unity 中读取 tokenizer.json 并执行 BPE 编码。
-///
-/// 算法与 HuggingFace tokenizers 库完全一致：
-///   1. 文本用 Qwen2 正则拆分为"单词"（不做 Unicode 归一化，因为 NFC 对 UTF-8 无副作用）
-///   2. 每个单词的每个字节映射到 GPT-2 byte-to-unicode 空间
-///   3. 用 BPE merge rules 合并
-///   4. 查 vocab 表返回 token id
-///
-/// 使用前：
-///   把 tokenizer.json 放到 StreamingAssets/OmniVoice/tokenizer.json
-///   var tok = Qwen2Tokenizer.Load(path);
-///   int[] ids = tok.Encode("你好世界", "Chinese");  // OmniVoice 格式
-/// </summary>
 public class Qwen2Tokenizer
 {
-    // ── OmniVoice 专用 Special Token IDs（来自 tokenizer.json added_tokens）──
+    // 硬编码 fallback（与 Qwen2 默认一致）
     public const int TOKEN_DENOISE = 151669;
     public const int TOKEN_LANG_START = 151670;
     public const int TOKEN_LANG_END = 151671;
@@ -31,10 +18,6 @@ public class Qwen2Tokenizer
     public const int TOKEN_IM_END = 151645;
     public const int TOKEN_ENDOFTEXT = 151643;
 
-    // ── GPT-2 byte→unicode 映射（256 个固定值，硬编码避免依赖）────────────
-    // byte index → unicode codepoint
-    // 生成规则：bytes 33-126、161-172、174-255 映射到自身；
-    // 其余 0-32、127-160、173 映射到 256+ 的连续码点。
     static readonly int[] ByteToUnicode = new int[256]
     {
         256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,
@@ -55,26 +38,17 @@ public class Qwen2Tokenizer
         240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
     };
 
-    // ── 内部数据 ─────────────────────────────────────────────
-    readonly Dictionary<string, int> _vocab;          // token_str → id
-    readonly Dictionary<(string, string), int> _merges; // pair → rank
-    readonly Dictionary<string, int> _specialTokens;   // "<|...|>" → id
+    readonly Dictionary<string, int> _vocab;
+    readonly Dictionary<(string, string), int> _merges;
+    readonly Dictionary<string, int> _specialTokens;
 
-    Qwen2Tokenizer(
-        Dictionary<string, int> vocab,
-        Dictionary<(string, string), int> merges,
-        Dictionary<string, int> specialTokens)
+    Qwen2Tokenizer(Dictionary<string, int> vocab, Dictionary<(string, string), int> merges, Dictionary<string, int> specialTokens)
     {
         _vocab = vocab;
         _merges = merges;
         _specialTokens = specialTokens;
     }
 
-    // ── 工厂方法 ──────────────────────────────────────────────
-    /// <summary>
-    /// 从 tokenizer.json 加载。必须在后台线程调用（文件 ~11MB，解析约 1-2 秒）。
-    /// 失败返回 null。
-    /// </summary>
     public static Qwen2Tokenizer Load(string tokenizerJsonPath)
     {
         if (!File.Exists(tokenizerJsonPath))
@@ -82,7 +56,6 @@ public class Qwen2Tokenizer
             Debug.LogError($"[Qwen2Tokenizer] File not found: {tokenizerJsonPath}");
             return null;
         }
-
         try
         {
             string json = File.ReadAllText(tokenizerJsonPath, Encoding.UTF8);
@@ -95,26 +68,19 @@ public class Qwen2Tokenizer
         }
     }
 
-    // ── JSON 解析（不依赖 Newtonsoft，纯手写解析器）──────────
     static Qwen2Tokenizer ParseJson(string json)
     {
-        // 用 Unity 内置的 JsonUtility 不支持任意嵌套，改用轻量手写解析
-        // 结构固定，直接用字符串定位法提取三个字段
-
-        // 1. added_tokens → specialTokens
         var specialTokens = new Dictionary<string, int>();
         {
             int arrStart = json.IndexOf("\"added_tokens\"", StringComparison.Ordinal);
             int arrBracket = json.IndexOf('[', arrStart);
-            int depth = 0;
-            int arrEnd = arrBracket;
+            int depth = 0, arrEnd = arrBracket;
             for (int i = arrBracket; i < json.Length; i++)
             {
                 if (json[i] == '[') depth++;
                 else if (json[i] == ']') { depth--; if (depth == 0) { arrEnd = i; break; } }
             }
             string arrSlice = json.Substring(arrBracket, arrEnd - arrBracket + 1);
-            // parse each object in the array
             int pos = 0;
             while (true)
             {
@@ -131,55 +97,43 @@ public class Qwen2Tokenizer
             }
         }
 
-        // 2. model.vocab → Dictionary<string,int>
         var vocab = new Dictionary<string, int>(160000);
         {
             int modelPos = json.IndexOf("\"model\"", StringComparison.Ordinal);
             int vocabPos = json.IndexOf("\"vocab\"", modelPos, StringComparison.Ordinal);
             int vocabBrace = json.IndexOf('{', vocabPos);
-            // Parse key:value pairs until closing }
-            // Keys and values can be any valid JSON string / number
             int i = vocabBrace + 1;
             while (i < json.Length)
             {
-                // skip whitespace
                 while (i < json.Length && json[i] <= ' ') i++;
                 if (json[i] == '}') break;
                 if (json[i] != '"') { i++; continue; }
-                // read key
                 int keyStart = i + 1;
                 int keyEnd = FindStringEnd(json, keyStart);
                 string key = Unescape(json.Substring(keyStart, keyEnd - keyStart));
                 i = keyEnd + 1;
-                // skip : and whitespace
                 while (i < json.Length && (json[i] <= ' ' || json[i] == ':')) i++;
-                // read integer value
                 int numStart = i;
                 while (i < json.Length && (json[i] >= '0' && json[i] <= '9')) i++;
                 int id = int.Parse(json.Substring(numStart, i - numStart));
                 vocab[key] = id;
-                // skip comma
                 while (i < json.Length && (json[i] <= ' ' || json[i] == ',')) i++;
             }
         }
 
-        // 3. model.merges → ordered list
         var merges = new Dictionary<(string, string), int>(160000);
         {
             int modelPos = json.IndexOf("\"model\"", StringComparison.Ordinal);
             int mergesPos = json.IndexOf("\"merges\"", modelPos, StringComparison.Ordinal);
             int arrBracket = json.IndexOf('[', mergesPos);
-            int rank = 0;
-            int i = arrBracket + 1;
+            int rank = 0, i = arrBracket + 1;
             while (i < json.Length)
             {
                 while (i < json.Length && json[i] <= ' ') i++;
                 if (json[i] == ']') break;
                 if (json[i] == ',') { i++; continue; }
-
                 if (json[i] == '"')
                 {
-                    // String format: "left right"
                     int sStart = i + 1;
                     int sEnd = FindStringEnd(json, sStart);
                     string s = Unescape(json.Substring(sStart, sEnd - sStart));
@@ -190,8 +144,7 @@ public class Qwen2Tokenizer
                 }
                 else if (json[i] == '[')
                 {
-                    // Array format: ["left","right"]
-                    i++; // skip [
+                    i++;
                     while (i < json.Length && json[i] <= ' ') i++;
                     int s1Start = i + 1;
                     int s1End = FindStringEnd(json, s1Start);
@@ -204,12 +157,9 @@ public class Qwen2Tokenizer
                     merges[(s1, s2)] = rank++;
                     i = s2End + 1;
                     while (i < json.Length && json[i] != ']') i++;
-                    i++; // skip ]
-                }
-                else
-                {
                     i++;
                 }
+                else i++;
             }
         }
 
@@ -217,7 +167,6 @@ public class Qwen2Tokenizer
         return new Qwen2Tokenizer(vocab, merges, specialTokens);
     }
 
-    // ── 字符串解析辅助 ────────────────────────────────────────
     static int FindStringEnd(string s, int start)
     {
         for (int i = start; i < s.Length; i++)
@@ -285,33 +234,33 @@ public class Qwen2Tokenizer
         return Unescape(obj.Substring(start, end - start));
     }
 
-    // ── BPE 编码 ──────────────────────────────────────────────
-    /// <summary>
-    /// 将 UTF-8 文本字符串编码为 token id 列表。
-    /// 不做 Qwen2 的 regex 预分词（对中文效果一致，对英文可能有微小差异）。
-    /// </summary>
+    // ★ 修复：增加 Qwen2/GPT-2 预分词正则，与 HuggingFace 一致
+    static readonly Regex Qwen2Regex = new Regex(
+        @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        RegexOptions.Compiled
+    );
+
     public int[] EncodeText(string text)
     {
         if (string.IsNullOrEmpty(text)) return Array.Empty<int>();
-
-        // 字节→unicode空间
-        byte[] utf8 = Encoding.UTF8.GetBytes(text);
-        // 用 Qwen2 pre-tokenizer: 按空格/标点分段后再 byte-level BPE
-        // 简化版：整体 byte-level BPE（对中文结果相同，英文可能有 1-2 token 差异）
-        var byteChars = new string[utf8.Length];
-        for (int i = 0; i < utf8.Length; i++)
-            byteChars[i] = ((char)ByteToUnicode[utf8[i]]).ToString();
-
-        return BpeTokenize(byteChars);
+        var ids = new List<int>();
+        foreach (Match m in Qwen2Regex.Matches(text))
+        {
+            string word = m.Value;
+            byte[] utf8 = Encoding.UTF8.GetBytes(word);
+            var byteChars = new string[utf8.Length];
+            for (int i = 0; i < utf8.Length; i++)
+                byteChars[i] = ((char)ByteToUnicode[utf8[i]]).ToString();
+            ids.AddRange(BpeTokenize(byteChars));
+        }
+        return ids.ToArray();
     }
 
     int[] BpeTokenize(string[] chars)
     {
         var tokens = new List<string>(chars);
-
         while (tokens.Count > 1)
         {
-            // 找 rank 最小（最优先合并）的相邻对
             int bestRank = int.MaxValue;
             int bestIndex = -1;
             for (int i = 0; i < tokens.Count - 1; i++)
@@ -323,54 +272,52 @@ public class Qwen2Tokenizer
                 }
             }
             if (bestIndex < 0) break;
-
             string merged = tokens[bestIndex] + tokens[bestIndex + 1];
             tokens[bestIndex] = merged;
             tokens.RemoveAt(bestIndex + 1);
         }
-
         var ids = new int[tokens.Count];
         for (int i = 0; i < tokens.Count; i++)
             ids[i] = _vocab.TryGetValue(tokens[i], out int id) ? id : TOKEN_ENDOFTEXT;
         return ids;
     }
 
-    // ── OmniVoice 专用：构建完整 prompt token 序列 ───────────
     /// <summary>
-    /// 构建 OmniVoice voice_clone / voice_design / auto 模式的 prompt。
-    ///
-    /// 格式：
-    ///   &lt;|denoise|&gt; &lt;|lang_start|&gt; {language} &lt;|lang_end|&gt;
-    ///   [&lt;|instruct_start|&gt; {instruct} &lt;|instruct_end|&gt;]   (voice_design only)
-    ///   &lt;|text_start|&gt; {text} &lt;|text_end|&gt;
+    /// 构建 OmniVoice prompt。Special token ID 优先从 tokenizer.json 读取，fallback 到硬编码。
     /// </summary>
-    /// <param name="text">要合成的文本</param>
-    /// <param name="language">语言名称，如 "Chinese"、"English"</param>
-    /// <param name="instruct">语音设计指令（可为 null）</param>
     public int[] BuildPrompt(string text, string language = "Chinese", string instruct = null)
     {
         var ids = new List<int>();
 
-        ids.Add(TOKEN_DENOISE);
-        ids.Add(TOKEN_LANG_START);
+        int GetId(string key, int fallback) => _specialTokens.TryGetValue(key, out int id) ? id : fallback;
+
+        int denoise = GetId("|<|denoise|>", TOKEN_DENOISE);
+        int langStart = GetId("|<|lang_start|>", TOKEN_LANG_START);
+        int langEnd = GetId("|<|lang_end|>", TOKEN_LANG_END);
+        int instructStart = GetId("|<|instruct_start|>", TOKEN_INSTRUCT_START);
+        int instructEnd = GetId("|<|instruct_end|>", TOKEN_INSTRUCT_END);
+        int textStart = GetId("|<|text_start|>", TOKEN_TEXT_START);
+        int textEnd = GetId("|<|text_end|>", TOKEN_TEXT_END);
+
+        ids.Add(denoise);
+        ids.Add(langStart);
         ids.AddRange(EncodeText(language));
-        ids.Add(TOKEN_LANG_END);
+        ids.Add(langEnd);
 
         if (!string.IsNullOrEmpty(instruct))
         {
-            ids.Add(TOKEN_INSTRUCT_START);
+            ids.Add(instructStart);
             ids.AddRange(EncodeText(instruct));
-            ids.Add(TOKEN_INSTRUCT_END);
+            ids.Add(instructEnd);
         }
 
-        ids.Add(TOKEN_TEXT_START);
+        ids.Add(textStart);
         ids.AddRange(EncodeText(text));
-        ids.Add(TOKEN_TEXT_END);
+        ids.Add(textEnd);
 
         return ids.ToArray();
     }
 
-    /// <summary>特殊 token id 查找（如 "&lt;|im_end|&gt;"）</summary>
     public bool TryGetSpecialToken(string content, out int id) =>
         _specialTokens.TryGetValue(content, out id);
 }

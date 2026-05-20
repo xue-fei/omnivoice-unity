@@ -290,7 +290,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b7123abd33588224da73b78ac60b07b5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  referenceAudio: {fileID: 8300000, guid: 5e8aa31b2039fb74caa482c53d51b674, type: 3}
+  referenceAudio: {fileID: 8300000, guid: b862404ba57c83149bb084e6db1f66dd, type: 3}
   targetText: "\u4F60\u597D\uFF0C\u8FD9\u662F\u4F7F\u7528\u8BED\u97F3\u514B\u9686\u751F\u6210\u7684\u97F3\u9891\u3002"
   targetLanguage: Chinese
   outputAudioSource: {fileID: 384914473}
@@ -302,7 +302,7 @@ MonoBehaviour:
   guidanceScale: 2
   tShift: 0.1
   maskTemperature: 5
-  layerPenaltyFactor: 1
+  layerPenaltyFactor: 5
   targetDurSec: 0
 --- !u!82 &384914473
 AudioSource:

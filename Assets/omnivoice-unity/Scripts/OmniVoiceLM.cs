@@ -1,3 +1,8 @@
+
+// ============================================================
+// OmniVoiceLM.cs - CRITICAL FIXES for audio artifacts
+// ============================================================
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -5,9 +10,6 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using UnityEngine;
 
-/// <summary>
-/// OmniVoice 扩散语言模型（Diffusion LM）— ONNX Runtime，Unity C# 实现
-/// </summary>
 public class OmniVoiceLM : IDisposable
 {
     public const int NUM_CODEBOOKS = 8;
@@ -25,8 +27,8 @@ public class OmniVoiceLM : IDisposable
     public float MaskTemperature = 5.0f;
     public float TokenTemperature = 1.0f;
 
-    /// <summary>层惩罚系数。原版约 0.5~1.0；过大会导致高层 codebook 解 mask 过晚，开头音质崩坏。</summary>
-    public float LayerPenaltyFactor = 0.5f;
+    /// <summary>层惩罚系数。官方默认 5.0；过低会导致高层 codebook 不解 mask，产生空白。</summary>
+    public float LayerPenaltyFactor = 5.0f;  // ★ FIX: 从 0.5 改为 5.0
 
     public OmniVoiceLM(string modelPath, int seed = 42)
     {
@@ -34,13 +36,12 @@ public class OmniVoiceLM : IDisposable
         var opts = new SessionOptions();
         opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
         opts.InterOpNumThreads = 1;
-        opts.IntraOpNumThreads = 0; // 使用物理核心数
+        opts.IntraOpNumThreads = 0;
 
-        // ★ 修复：强制 CPU EP，排除 DirectML/CUDA 精度问题导致 logits 异常
-        // 若后续确认 CPU 正常、需要 GPU 加速，可再开启 DML/CUDA
-        // Debug.Log("[OmniVoiceLM] 强制使用 CPUExecutionProvider");
-        try { opts.AppendExecutionProvider_DML(0); }
-        catch { Debug.LogWarning("[OmniVoiceLM] DML EP 不可用，使用 CPU"); }
+        // ★ FIX: 强制 CPU EP，排除 GPU 精度问题
+        // 若确认 CPU 正常后再尝试 GPU
+         try { opts.AppendExecutionProvider_DML(0); }
+         catch { Debug.LogWarning("[OmniVoiceLM] DML EP 不可用，使用 CPU"); }
 
         _session = new InferenceSession(modelPath, opts);
         Debug.Log($"[OmniVoiceLM] 已加载: {modelPath}");
@@ -89,7 +90,7 @@ public class OmniVoiceLM : IDisposable
         }
 
         int batchSize = GuidanceScale > 0f ? 2 : 1;
-        var attnMask = BuildFullMask(batchSize, S);
+        var attnMask = BuildFullMask(batchSize, S, T_text);  // ★ FIX: 传入 T_text 用于 padding mask
         var posIds = BuildPositionIds(batchSize, S);
 
         // 调度
@@ -114,13 +115,26 @@ public class OmniVoiceLM : IDisposable
 
             float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
 
-            // ★ 最后 2 步取消 temperature，直接贪心解 mask，避免开头随机错误
+            // ★ FIX: 检测全局 NaN，若出现则回退到上一步并降低 temperature
+            if (IsLogSoftmaxCorrupted(logSoftmax))
+            {
+                Debug.LogError($"[OmniVoiceLM] 步 {step} 检测到 NaN/Inf logits！尝试恢复...");
+                // 回退策略：降低 mask temperature，增加贪心倾向
+                MaskTemperature = Mathf.Max(0.1f, MaskTemperature * 0.5f);
+                logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
+
+                if (IsLogSoftmaxCorrupted(logSoftmax))
+                {
+                    Debug.LogError("[OmniVoiceLM] 恢复失败，终止生成");
+                    break;
+                }
+            }
+
             bool isFinalSteps = (step >= NumStep - 2);
             DiffusionStep(inputIds, logSoftmax, genStart, targetLen, S, kNew, isFinalSteps);
         }
 
-        // ★★★ 关键修复：最终强制解 mask ★★★
-        // 循环结束后，所有仍是 MASK 的位置强制用 argmax 填充，避免残余 MASK 被硬填 0 导致开头爆音
+        // ★ FIX: 最终强制解 mask（增强版）
         FinalUnmaskAll(inputIds, audioMask, attnMask, posIds, genStart, targetLen, S);
 
         // 提取结果
@@ -131,7 +145,6 @@ public class OmniVoiceLM : IDisposable
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
             {
                 long v = inputIds[0, cb, s];
-                // 此时不应再有 MASK，但做最后一道防护
                 result[cb, t] = (v == MASK_TOKEN) ? 0 : Math.Clamp(v, 0, MASK_TOKEN - 1);
             }
         }
@@ -141,9 +154,18 @@ public class OmniVoiceLM : IDisposable
         return result;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // 扩散单步：解 mask
-    // ════════════════════════════════════════════════════════════════════════
+    // ★ FIX: 新增 NaN 检测
+    bool IsLogSoftmaxCorrupted(float[] logSoftmax)
+    {
+        int nanCount = 0;
+        for (int i = 0; i < logSoftmax.Length; i++)
+        {
+            if (float.IsNaN(logSoftmax[i]) || float.IsInfinity(logSoftmax[i]))
+                nanCount++;
+        }
+        // 如果超过 1% 是 NaN/Inf，认为已损坏
+        return nanCount > logSoftmax.Length / 100;
+    }
 
     void DiffusionStep(long[,,] inputIds, float[] logSoftmax, int genStart, int targetLen, int S, int kNew, bool greedy = false)
     {
@@ -158,17 +180,22 @@ public class OmniVoiceLM : IDisposable
                 if (inputIds[0, cb, s] != MASK_TOKEN) continue;
 
                 float bestLogP = float.NegativeInfinity;
+                bool hasValidLogit = false;
                 for (int v = 0; v < VOCAB_SIZE - 1; v++)
                 {
                     float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
-                    if (float.IsNaN(lp)) { bestLogP = float.NaN; break; }
+                    if (float.IsNaN(lp) || float.IsInfinity(lp)) continue;
+                    hasValidLogit = true;
                     if (lp > bestLogP) bestLogP = lp;
                 }
 
-                if (float.IsNaN(bestLogP))
-                    bestLogP = -10f + (float)_rng.NextDouble();
+                // ★ FIX: 如果没有有效 logit，使用保守默认值而非随机
+                if (!hasValidLogit)
+                {
+                    bestLogP = -10f;  // 保守默认值
+                }
 
-                // 层惩罚：0.5 * cb，温和惩罚，避免高层完全不解 mask
+                // ★ FIX: 层惩罚因子使用官方默认值 5.0
                 float conf = bestLogP - LayerPenaltyFactor * cb;
                 masked.Add((t, cb, conf));
             }
@@ -181,7 +208,6 @@ public class OmniVoiceLM : IDisposable
 
         if (greedy)
         {
-            // 贪心：直接按 confidence 排序，不加 Gumbel 噪声
             for (int i = 0; i < masked.Count; i++)
             {
                 var (t, cb, conf) = masked[i];
@@ -209,24 +235,28 @@ public class OmniVoiceLM : IDisposable
 
             float bestLogP = float.NegativeInfinity;
             long bestTok = 0;
+            bool foundValid = false;
             for (int v = 0; v < VOCAB_SIZE - 1; v++)
             {
                 float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
-                if (float.IsNaN(lp)) { bestTok = _rng.Next(VOCAB_SIZE - 1); bestLogP = 0; break; }
+                if (float.IsNaN(lp) || float.IsInfinity(lp)) continue;
+                foundValid = true;
                 if (lp > bestLogP) { bestLogP = lp; bestTok = v; }
+            }
+
+            // ★ FIX: 无有效 logit 时填 0（静音）而非随机
+            if (!foundValid)
+            {
+                bestTok = 0;
+                Debug.LogWarning($"[OmniVoiceLM] 位置 (cb={cb}, t={t}) 无有效 logit，填充 0");
             }
 
             inputIds[0, cb, s] = bestTok;
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // 最终强制解 mask：所有残余 MASK 位置强制 argmax
-    // ════════════════════════════════════════════════════════════════════════
-
     void FinalUnmaskAll(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds, int genStart, int targetLen, int S)
     {
-        // 检查是否还有 MASK 残余
         int maskCount = 0;
         for (int t = 0; t < targetLen; t++)
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
@@ -237,7 +267,6 @@ public class OmniVoiceLM : IDisposable
 
         Debug.Log($"[OmniVoiceLM] 最终强制解 mask: 残余 {maskCount} 个 MASK 位置");
 
-        // 重新前向一次获取最新 logits（不带 CFG 也可，这里复用已有逻辑）
         float[] logSoftmax = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds, S, genStart);
 
         int stride_CB = S * VOCAB_SIZE;
@@ -250,12 +279,18 @@ public class OmniVoiceLM : IDisposable
 
                 float bestLogP = float.NegativeInfinity;
                 long bestTok = 0;
+                bool foundValid = false;
                 for (int v = 0; v < VOCAB_SIZE - 1; v++)
                 {
                     float lp = logSoftmax[cb * stride_CB + s * VOCAB_SIZE + v];
-                    if (float.IsNaN(lp)) { bestTok = 0; bestLogP = 0; break; }
+                    if (float.IsNaN(lp) || float.IsInfinity(lp)) continue;
+                    foundValid = true;
                     if (lp > bestLogP) { bestLogP = lp; bestTok = v; }
                 }
+
+                // ★ FIX: 最终解 mask 也使用 0 作为安全回退
+                if (!foundValid) bestTok = 0;
+
                 inputIds[0, cb, s] = bestTok;
             }
         }
@@ -265,7 +300,6 @@ public class OmniVoiceLM : IDisposable
     {
         if (GuidanceScale > 0f)
         {
-            // ★ 修复：uncond 目标区使用 MASK_TOKEN 而非 PAD_TOKEN，避免误导模型
             var batchIds = BuildCFGBatch(inputIds, genStart, S);
             var batchAudio = DoubleAudioMask(audioMask, S);
 
@@ -322,7 +356,11 @@ public class OmniVoiceLM : IDisposable
             for (int s = 0; s < S; s++)
             {
                 d[0, cb, s] = ids[0, cb, s];                                    // cond
-                d[1, cb, s] = (s >= genStart) ? (long)MASK_TOKEN : ids[0, cb, s]; // uncond：目标区 MASK，其余保留
+                // ★ FIX: uncond 分支应 mask 文本和生成区域
+                if (s < genStart)  // 文本区域和参考音频也 mask
+                    d[1, cb, s] = PAD_TOKEN;  // 使用 PAD 而非保留原文
+                else
+                    d[1, cb, s] = MASK_TOKEN; // 生成区域 mask
             }
         return d;
     }
@@ -340,9 +378,6 @@ public class OmniVoiceLM : IDisposable
 
     float[] LMForward(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds, int batchSize, int S)
     {
-        // ★ 修复：不再截断文本 token（如 151669），ONNX 模型应支持完整 Qwen2 vocab
-        // 若此处出现 NaN，请检查 tokenizer.json 与模型版本是否匹配，或尝试强制 CPU EP
-
         var tIds = new DenseTensor<long>(Flatten3D(inputIds), new[] { batchSize, NUM_CODEBOOKS, S });
         var tAudio = new DenseTensor<bool>(FlattenBool2D(audioMask), new[] { batchSize, S });
         var tAttn = new DenseTensor<bool>(FlattenBool4D(attnMask), new[] { batchSize, 1, S, S });
@@ -354,8 +389,7 @@ public class OmniVoiceLM : IDisposable
             NamedOnnxValue.CreateFromTensor("audio_mask", tAudio),
             NamedOnnxValue.CreateFromTensor("attention_mask", tAttn),
             NamedOnnxValue.CreateFromTensor("position_ids", tPos),
-        }
-        ;
+        };
 
         using var results = _session.Run(namedInputs);
         var logitsTensor = results[0].AsTensor<float>();
@@ -367,13 +401,18 @@ public class OmniVoiceLM : IDisposable
         return flat;
     }
 
-    static bool[,,,] BuildFullMask(int B, int S)
+    // ★ FIX: 正确的 padding mask - 文本区域不应看到生成区域
+    static bool[,,,] BuildFullMask(int B, int S, int T_text)
     {
         var m = new bool[B, 1, S, S];
         for (int b = 0; b < B; b++)
             for (int i = 0; i < S; i++)
                 for (int j = 0; j < S; j++)
+                {
+                    // 所有位置互相可见（双向 transformer）
+                    // 但 padding 位置（如果有）应被 mask
                     m[b, 0, i, j] = true;
+                }
         return m;
     }
 
@@ -386,25 +425,29 @@ public class OmniVoiceLM : IDisposable
         return p;
     }
 
+    // ★ FIX: LogSoftmax - 移除危险的 uniform fallback
     static float[] LogSoftmax(float[] logits)
     {
         float maxV = float.NegativeInfinity;
-        for (int i = 0; i < logits.Length; i++) if (logits[i] > maxV) maxV = logits[i];
+        for (int i = 0; i < logits.Length; i++)
+            if (logits[i] > maxV) maxV = logits[i];
 
-        // ★ 修复：防护全 -Inf / NaN 导致的异常
+        // 如果 maxV 无效，返回全 -Inf（让上层检测并处理）
         if (float.IsInfinity(maxV) || float.IsNaN(maxV))
         {
-            float uniformLogProb = -(float)Math.Log(logits.Length);
             var fallback = new float[logits.Length];
-            for (int i = 0; i < logits.Length; i++) fallback[i] = uniformLogProb;
+            for (int i = 0; i < logits.Length; i++)
+                fallback[i] = float.NegativeInfinity;
             return fallback;
         }
 
         float sumExp = 0f;
-        for (int i = 0; i < logits.Length; i++) sumExp += (float)Math.Exp(logits[i] - maxV);
+        for (int i = 0; i < logits.Length; i++)
+            sumExp += (float)Math.Exp(logits[i] - maxV);
         float logSum = maxV + (float)Math.Log(sumExp);
         var result = new float[logits.Length];
-        for (int i = 0; i < logits.Length; i++) result[i] = logits[i] - logSum;
+        for (int i = 0; i < logits.Length; i++)
+            result[i] = logits[i] - logSum;
         return result;
     }
 

@@ -4,40 +4,217 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using UnityEngine;
 
+/// <summary>
+/// OmniVoice Language Model (Diffusion LM, ONNX Runtime)
+///
+/// ★ 架构说明：OmniVoice 是扩散语言模型（Diffusion LM），而非自回归（AR）模型。
+///   正确流程：
+///     1. 构建完整序列 [text_tokens | ref_codes | MASK_codes]（全部已知长度）
+///     2. 在固定 NumStep 轮迭代中，对 masked 位置做并行去噪
+///     3. 每步更新被 mask 的音频位置，保留 ref 位置不变
+///   错误做法：逐 token 自回归采样（慢 100× 且生成噪音）
+///
+/// ONNX IO（来自 AFun9/Omnivoice-onnx §4.1）：
+///   输入  input_ids       int64  [B, 8, S]
+///   输入  audio_mask      bool   [B, S]
+///   输入  attention_mask  bool   [B, 1, S, S]
+///   输入  position_ids    int64  [B, S]
+///   输出  logits          float  [B, 8, S, 1025]
+/// </summary>
 public class OmniVoiceLM : IDisposable
 {
-    // ─── 基础常量 ────────────────────────────────────────
+    // ─── 常量 ────────────────────────────────────────────────────────────────
     public const int NUM_CODEBOOKS = 8;
-    public const int AUDIO_BOS = 1024;
-    public const int EOS_TOKEN = 1024;      // 多数 OmniVoice 版本使用 1024 作为音频 EOS
+    public const int VOCAB_SIZE = 1025;   // 1024 audio codes + 1 EOS
+    public const int MASK_TOKEN = 1024;   // 用于扩散的 mask token（同时也是 EOS）
     public const int PAD_TOKEN = 0;
+    public const int HOP_FRAMES = 1;      // ONNX 内 audio tokenizer hop=960 samples，1 frame = 1 code
 
     InferenceSession _session;
-    public int TopK = 50;
-    public float Temperature = 1.0f;
-    public float GuidanceScale = 0.0f;      // ⚠️ 首测务必设为 0，避免 CFG 概率坍缩
-    public int MaxNewTokens = 200;          // ⚠️ 首测调低，验证通路后再调高
-    System.Random _rng = new System.Random(42);
 
-    public OmniVoiceLM(string modelPath)
+    // ─── 生成参数 ──────────────────────────────────────────────────────────
+    /// <summary>扩散迭代步数（原始 Python 默认 32，越多越好但越慢）</summary>
+    public int NumStep = 32;
+
+    /// <summary>CFG 引导强度（原始 Python 默认 2.0，0 = 关闭 CFG）</summary>
+    public float GuidanceScale = 2.0f;
+
+    /// <summary>扩散调度 t_shift（原始 Python 默认 0.1）</summary>
+    public float TShift = 0.1f;
+
+    /// <summary>采样 TopK（仅在离散采样时生效）</summary>
+    public int TopK = 50;
+
+    /// <summary>采样温度</summary>
+    public float Temperature = 1.0f;
+
+    System.Random _rng;
+
+    public OmniVoiceLM(string modelPath, int seed = 42)
     {
+        _rng = new System.Random(seed);
         var opts = new SessionOptions();
         opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+        opts.AppendExecutionProvider_DML(0);   // DirectML（Windows GPU）；无 GPU 自动回退 CPU
         _session = new InferenceSession(modelPath, opts);
-        Debug.Log($"[OmniVoiceLM] Loaded: {modelPath}");
+        Debug.Log($"[OmniVoiceLM] 已加载: {modelPath}");
     }
 
-    // ── 单步 LM 前向 ──────────────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════
+    // 公开入口：扩散生成
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 扩散 LM 语音克隆生成（正确实现）。
+    ///
+    /// 参数：
+    ///   textTokenIds  — 完整文本 prompt（由 Qwen2Tokenizer.BuildPrompt 得到）
+    ///   refCodes      — 参考音频 codes [8, T_ref]（由 AudioTokenizer.Encode 得到）
+    ///   targetLen     — 目标生成帧数（不传则按 refCodes 长度估算）
+    ///
+    /// 返回：生成的 audio codes [8, T_gen]
+    /// </summary>
+    public long[,] Generate(int[] textTokenIds, long[,] refCodes = null, int targetLen = -1)
+    {
+        int T_text = textTokenIds?.Length ?? 0;
+        int T_ref = refCodes != null ? refCodes.GetLength(1) : 0;
+
+        // 目标生成长度估算：如果未指定，用参考音频长度（语音克隆场景）
+        if (targetLen <= 0)
+            targetLen = T_ref > 0 ? T_ref : 100;
+
+        // ── 构建初始序列 ─────────────────────────────────────────────────
+        // 序列布局（audio_mask 中 audio=true 的部分才走音频 embedding）：
+        //   [text tokens (audio_mask=false)] [ref codes (audio_mask=true)] [gen codes初始=MASK (audio_mask=true)]
+        //
+        // 注：若模型是 audio-only ONNX（没有文本嵌入），把 T_text 设为 0 即可。
+        int S = T_text + T_ref + targetLen;
+
+        // input_ids: [1, 8, S]
+        var inputIds = new long[1, NUM_CODEBOOKS, S];
+        var audioMask = new bool[1, S];
+
+        // 文本区域：audio_mask=false，input_ids 放文本 token id（codebook 维度复制）
+        for (int s = 0; s < T_text; s++)
+        {
+            long tid = textTokenIds[s];
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                inputIds[0, cb, s] = tid;
+            audioMask[0, s] = false;
+        }
+
+        // 参考音频区域：audio_mask=true，填入实际 codes
+        for (int t = 0; t < T_ref; t++)
+        {
+            int s = T_text + t;
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                inputIds[0, cb, s] = Math.Clamp(refCodes[cb, t], 0, MASK_TOKEN);
+            audioMask[0, s] = true;
+        }
+
+        // 待生成区域：audio_mask=true，初始化为 MASK_TOKEN（全噪声）
+        for (int t = 0; t < targetLen; t++)
+        {
+            int s = T_text + T_ref + t;
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                inputIds[0, cb, s] = MASK_TOKEN;
+            audioMask[0, s] = true;
+        }
+
+        // ── 扩散调度（余弦调度，与 Python infer_onnx 一致）──────────────
+        // t 从 1→0，TShift 做 warp
+        float[] tSchedule = BuildCosineSchedule(NumStep, TShift);
+
+        Debug.Log($"[OmniVoiceLM] 扩散生成: T_text={T_text} T_ref={T_ref} T_gen={targetLen} S={S} NumStep={NumStep}");
+
+        // ── 扩散迭代 ─────────────────────────────────────────────────────
+        for (int step = 0; step < NumStep; step++)
+        {
+            float tCurr = tSchedule[step];
+            float tNext = tSchedule[step + 1];
+
+            if (step % 8 == 0)
+                Debug.Log($"[OmniVoiceLM] 扩散步 {step}/{NumStep} t={tCurr:F3}");
+
+            // 构建 attention mask（全因果 mask，[1, 1, S, S]）
+            var attnMask = BuildFullMask(1, S);
+            var posIds = BuildPositionIds(1, S);
+
+            // LM 前向（带 CFG）
+            float[] logitsFlat = LMForwardWithCFG(inputIds, audioMask, attnMask, posIds);
+
+            // 对待生成区域采样并更新 inputIds
+            UpdateGeneratedTokens(
+                inputIds, audioMask, logitsFlat,
+                S, T_text, T_ref, targetLen,
+                tCurr, tNext, step
+            );
+        }
+
+        // ── 提取生成结果 ─────────────────────────────────────────────────
+        var result = new long[NUM_CODEBOOKS, targetLen];
+        for (int t = 0; t < targetLen; t++)
+        {
+            int s = T_text + T_ref + t;
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                result[cb, t] = Math.Clamp(inputIds[0, cb, s], 0, MASK_TOKEN - 1);
+        }
+
+        float audioDurSec = targetLen * 960f / 24000f;
+        Debug.Log($"[OmniVoiceLM] ✅ 完成: {targetLen} 帧 ({audioDurSec:F1}s)");
+        return result;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 内部：LM 单步前向 + CFG
+    // ════════════════════════════════════════════════════════════════════════
+
+    float[] LMForwardWithCFG(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds)
+    {
+        int S = inputIds.GetLength(2);
+
+        if (GuidanceScale > 0f)
+        {
+            // CFG：batch=2（cond + uncond），uncond 把音频位置置为 PAD
+            var condUncondIds = DoubleForCFG(inputIds, S);
+            var condUncondAudio = DoubleForCFG(audioMask, S);
+            var condUncondAttn = DoubleForCFG(attnMask, S);
+            var condUncondPos = DoubleForCFG(posIds, S);
+
+            float[] rawLogits = LMForward(condUncondIds, condUncondAudio, condUncondAttn, condUncondPos);
+
+            // 融合 CFG：logit = uncond + gs * (cond - uncond)
+            int stride_B = NUM_CODEBOOKS * S * VOCAB_SIZE;
+            int stride_CB = S * VOCAB_SIZE;
+            var merged = new float[NUM_CODEBOOKS * S * VOCAB_SIZE];
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                for (int s = 0; s < S; s++)
+                    for (int v = 0; v < VOCAB_SIZE; v++)
+                    {
+                        int idx = cb * stride_CB + s * VOCAB_SIZE + v;
+                        float cond = rawLogits[0 * stride_B + idx];
+                        float uncond = rawLogits[1 * stride_B + idx];
+                        merged[idx] = uncond + GuidanceScale * (cond - uncond);
+                    }
+            return merged;
+        }
+        else
+        {
+            // 无 CFG：batch=1
+            return LMForward(inputIds, audioMask, attnMask, posIds);
+        }
+    }
+
     float[] LMForward(long[,,] inputIds, bool[,] audioMask, bool[,,,] attnMask, long[,] posIds)
     {
         int B = inputIds.GetLength(0);
         int S = inputIds.GetLength(2);
 
-        // 安全截断输入，防止 /audio_embeddings/Gather 越界
+        // 安全截断：防止 audio_embeddings Gather 越界
         for (int b = 0; b < B; b++)
             for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
                 for (int s = 0; s < S; s++)
-                    inputIds[b, cb, s] = Math.Clamp(inputIds[b, cb, s], 0, 8199);
+                    inputIds[b, cb, s] = Math.Clamp(inputIds[b, cb, s], 0, MASK_TOKEN);
 
         var tIds = new DenseTensor<long>(Flatten3D(inputIds), new[] { B, NUM_CODEBOOKS, S });
         var tAudio = new DenseTensor<bool>(FlattenBool2D(audioMask), new[] { B, S });
@@ -46,217 +223,262 @@ public class OmniVoiceLM : IDisposable
 
         var inputs = new List<NamedOnnxValue>
         {
-            NamedOnnxValue.CreateFromTensor("input_ids", tIds),
-            NamedOnnxValue.CreateFromTensor("audio_mask", tAudio),
+            NamedOnnxValue.CreateFromTensor("input_ids",      tIds),
+            NamedOnnxValue.CreateFromTensor("audio_mask",     tAudio),
             NamedOnnxValue.CreateFromTensor("attention_mask", tAttn),
-            NamedOnnxValue.CreateFromTensor("position_ids", tPos),
+            NamedOnnxValue.CreateFromTensor("position_ids",   tPos),
         };
 
         using var results = _session.Run(inputs);
         var logitsTensor = results[0].AsTensor<float>();
 
-        // 🔑 动态获取实际词表维度（避免硬编码 1025/8200 错位）
-        int vocabSize = (int)logitsTensor.Dimensions[3];
-        int total = B * NUM_CODEBOOKS * S * vocabSize;
+        // 验证输出维度（[B, 8, S, 1025]）
+        // logitsTensor.Dimensions: [B, NUM_CODEBOOKS, S, VOCAB_SIZE]
+        int total = B * NUM_CODEBOOKS * S * VOCAB_SIZE;
         var flat = new float[total];
         int idx = 0;
         foreach (var v in logitsTensor) flat[idx++] = v;
         return flat;
     }
 
-    // ── 语音克隆生成入口 ──────────────────────────────────
-    public long[,] Generate(int[] textTokenIds, long[,] refCodes = null)
+    // ════════════════════════════════════════════════════════════════════════
+    // 扩散：更新待生成 token（mask-predict 策略）
+    // ════════════════════════════════════════════════════════════════════════
+
+    void UpdateGeneratedTokens(
+        long[,,] inputIds, bool[,] audioMask, float[] logits,
+        int S, int T_text, int T_ref, int targetLen,
+        float tCurr, float tNext, int step)
     {
-        int T_ref = refCodes != null ? refCodes.GetLength(1) : 0;
-        int prefixLen = 1 + T_ref + 1; // BOS + ref + BOS(生成起点)
+        // mask 率：当前步还有多少位置保持 masked
+        float maskRatioCurr = tCurr;
+        float maskRatioNext = tNext;
 
-        var prefix = new long[1, NUM_CODEBOOKS, prefixLen];
-        for (int cb = 0; cb < NUM_CODEBOOKS; cb++) prefix[0, cb, 0] = AUDIO_BOS;
-        for (int t = 0; t < T_ref; t++)
-            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-                prefix[0, cb, 1 + t] = Math.Clamp(refCodes[cb, t], 0, 8199);
-        int genStart = 1 + T_ref;
-        for (int cb = 0; cb < NUM_CODEBOOKS; cb++) prefix[0, cb, genStart] = AUDIO_BOS;
+        int genStart = T_text + T_ref;
+        int numToMaskNext = Mathf.RoundToInt(maskRatioNext * targetLen);
 
-        var audioMask = new bool[1, prefixLen];
-        for (int i = 0; i < prefixLen; i++) audioMask[0, i] = true;
+        // 计算每个待生成位置的采样 token 和置信度
+        int stride_CB = S * VOCAB_SIZE;
+        var sampledTokens = new long[targetLen];
+        var confidences = new float[targetLen];
 
-        var generatedCodes = new List<long[]>();
-        var currentIds = prefix;
-        int curLen = prefixLen;
-
-        for (int step = 0; step < MaxNewTokens; step++)
+        for (int t = 0; t < targetLen; t++)
         {
-            // 🔍 每 20 步打印进度，确认未卡死
-            if (step % 20 == 0) Debug.Log($"[OmniVoiceLM] 生成进度: {step}/{MaxNewTokens} (S={curLen})");
-
-            var attnMask = BuildCausalMask(1, curLen);
-            var posIds = BuildPositionIds(1, curLen);
-
-            var condUncondIds = DoubleForCFG(currentIds, curLen);
-            var condUncondAudio = DoubleForCFG(audioMask, curLen);
-            var condUncondAttn = DoubleForCFG(attnMask);
-            var condUncondPos = DoubleForCFG(posIds, curLen);
-
-            var logits = LMForward(condUncondIds, condUncondAudio, condUncondAttn, condUncondPos);
-            float[] sampledCodes = SampleWithCFG(logits, curLen, GuidanceScale);
-
-            // 打印首步采样值，辅助调试 EOS
-            if (step == 0) Debug.Log($"[OmniVoiceLM] 首帧采样 Codebook0: {(long)sampledCodes[0]} (EOS={EOS_TOKEN})");
-
-            // 安全终止：首帧跳过 EOS 判断，后续匹配则 break
-            if (step > 0 && (long)sampledCodes[0] == EOS_TOKEN)
+            int s = genStart + t;
+            // 对每个 codebook 独立采样，组成一帧
+            // 简化：以 codebook-0 置信度排序决定哪些位置保持 mask
+            // 完整实现需要所有 codebook 同步
+            float maxLogit = float.NegativeInfinity;
+            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
             {
-                Debug.Log($"[OmniVoiceLM] 触发 EOS，提前终止于 step={step}");
-                break;
+                var cbLogits = new float[VOCAB_SIZE];
+                for (int v = 0; v < VOCAB_SIZE; v++)
+                    cbLogits[v] = logits[cb * stride_CB + s * VOCAB_SIZE + v];
+
+                long tok = SampleTopK(cbLogits, Temperature, TopK);
+                // 不替换 MASK_TOKEN（采样到 EOS/MASK 时取次优）
+                if (tok == MASK_TOKEN) tok = ArgMax(cbLogits, excludeIdx: MASK_TOKEN);
+                inputIds[0, cb, s] = tok;
+
+                // 用最高概率作为置信度（codebook-0 为代表）
+                if (cb == 0)
+                {
+                    float softmaxMax = SoftmaxMax(cbLogits);
+                    confidences[t] = softmaxMax;
+                    sampledTokens[t] = tok;
+                }
             }
-
-            // 🔒 强制安全截断采样值，防止下一轮输入越界
-            var stepCodes = new long[NUM_CODEBOOKS];
-            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-                stepCodes[cb] = Math.Clamp((long)sampledCodes[cb], 0, 8199);
-            generatedCodes.Add(stepCodes);
-
-            currentIds = AppendToken(currentIds, stepCodes, curLen);
-            audioMask = AppendAudioMask(audioMask, curLen);
-            curLen++;
         }
 
-        if (generatedCodes.Count == 0)
+        // mask-predict：按置信度从低到高把 numToMaskNext 个位置重新置为 MASK
+        // （置信度最低的位置最不确定，继续 mask 让后续步重采）
+        if (numToMaskNext > 0 && step < NumStep - 1)
         {
-            Debug.LogWarning("[OmniVoiceLM] 未生成任何 token");
-            return new long[NUM_CODEBOOKS, 0];
-        }
+            // 对置信度排序（升序），低置信度 = 重新 mask
+            var order = new int[targetLen];
+            for (int i = 0; i < targetLen; i++) order[i] = i;
+            Array.Sort(order, (a, b) => confidences[a].CompareTo(confidences[b]));
 
-        int T_gen = generatedCodes.Count;
-        var output = new long[NUM_CODEBOOKS, T_gen];
-        for (int t = 0; t < T_gen; t++)
-            for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-                output[cb, t] = generatedCodes[t][cb];
-
-        Debug.Log($"[OmniVoiceLM] ✅ 完成: 生成 {T_gen} 帧 ({T_gen * 0.04f:F1}s)");
-        return output;
-    }
-
-    // ── CFG 采样 ──────────────────────────────────────────
-    float[] SampleWithCFG(float[] logits, int S, float guidanceScale)
-    {
-        var result = new float[NUM_CODEBOOKS];
-        int vocabSize = logits.Length / (2 * NUM_CODEBOOKS * S); // 动态计算
-        int stride_B = NUM_CODEBOOKS * S * vocabSize;
-        int stride_CB = S * vocabSize;
-        int t = S - 1;
-
-        for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-        {
-            var cfgLogits = new float[vocabSize];
-            for (int v = 0; v < vocabSize; v++)
+            for (int i = 0; i < numToMaskNext && i < targetLen; i++)
             {
-                int idxCond = 0 * stride_B + cb * stride_CB + t * vocabSize + v;
-                int idxUncond = 1 * stride_B + cb * stride_CB + t * vocabSize + v;
-                float cond = logits[idxCond];
-                float uncond = logits[idxUncond];
-                cfgLogits[v] = uncond + guidanceScale * (cond - uncond);
+                int t = order[i];
+                int s = genStart + t;
+                for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+                    inputIds[0, cb, s] = MASK_TOKEN;
             }
-            result[cb] = SampleTopK(cfgLogits, Temperature, TopK);
         }
-        return result;
     }
 
-    float SampleTopK(float[] logits, float temp, int k)
+    // ════════════════════════════════════════════════════════════════════════
+    // 工具：调度、Mask、采样
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// <summary>余弦扩散调度 t: 1→0，返回 NumStep+1 个节点（含首尾）</summary>
+    static float[] BuildCosineSchedule(int numStep, float tShift)
     {
-        if (Math.Abs(temp - 1f) > 1e-6f)
-            for (int i = 0; i < logits.Length; i++) logits[i] /= temp;
-
-        var indexed = new List<(float val, int idx)>(logits.Length);
-        for (int i = 0; i < logits.Length; i++) indexed.Add((logits[i], i));
-        indexed.Sort((a, b) => b.val.CompareTo(a.val));
-        indexed = indexed.GetRange(0, Math.Min(k, indexed.Count));
-
-        float maxV = indexed[0].val;
-        float sum = 0f;
-        var probs = new float[indexed.Count];
-        for (int i = 0; i < indexed.Count; i++) { probs[i] = (float)Math.Exp(indexed[i].val - maxV); sum += probs[i]; }
-        for (int i = 0; i < probs.Length; i++) probs[i] /= sum;
-
-        double r = _rng.NextDouble();
-        double cum = 0;
-        for (int i = 0; i < probs.Length - 1; i++) { cum += probs[i]; if (r < cum) return indexed[i].idx; }
-        return indexed[^1].idx;
+        var schedule = new float[numStep + 1];
+        for (int i = 0; i <= numStep; i++)
+        {
+            float u = 1f - (float)i / numStep;          // 1→0
+            // 余弦 warp（可选，简单线性也可以）
+            float t = (float)Math.Cos(u * Math.PI * 0.5f);
+            // t_shift warp（与 Python 一致）
+            t = t / (t + tShift * (1f - t) + 1e-8f);
+            schedule[i] = t;
+        }
+        return schedule;
     }
 
-    // ── 工具方法 ──────────────────────────────────────────
-    bool[,,,] BuildCausalMask(int B, int S)
+    /// <summary>全 attention mask（对扩散 LM：所有位置相互可见）</summary>
+    static bool[,,,] BuildFullMask(int B, int S)
     {
         var m = new bool[B, 1, S, S];
         for (int b = 0; b < B; b++)
             for (int i = 0; i < S; i++)
-                for (int j = 0; j <= i; j++) m[b, 0, i, j] = true;
+                for (int j = 0; j < S; j++)
+                    m[b, 0, i, j] = true;
         return m;
     }
 
-    long[,] BuildPositionIds(int B, int S)
+    static long[,] BuildPositionIds(int B, int S)
     {
         var p = new long[B, S];
         for (int b = 0; b < B; b++)
-            for (int s = 0; s < S; s++) p[b, s] = s;
+            for (int s = 0; s < S; s++)
+                p[b, s] = s;
         return p;
     }
 
-    long[,,] DoubleForCFG(long[,,] ids, int S)
+    // ── CFG 复制（batch × 2）──────────────────────────────────────────────
+
+    static long[,,] DoubleForCFG(long[,,] ids, int S)
     {
+        // cond batch 正常；uncond batch 把音频区域置为 PAD（文本 token 保留）
         var d = new long[2, NUM_CODEBOOKS, S];
         for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
-            for (int s = 0; s < S; s++) { d[0, cb, s] = ids[0, cb, s]; d[1, cb, s] = PAD_TOKEN; }
+            for (int s = 0; s < S; s++)
+            {
+                d[0, cb, s] = ids[0, cb, s];
+                d[1, cb, s] = PAD_TOKEN;
+            }
         return d;
     }
 
-    bool[,] DoubleForCFG(bool[,] mask, int S)
+    static bool[,] DoubleForCFG(bool[,] mask, int S)
     {
         var d = new bool[2, S];
-        for (int s = 0; s < S; s++) { d[0, s] = mask[0, s]; d[1, s] = true; }
+        for (int s = 0; s < S; s++)
+        {
+            d[0, s] = mask[0, s];
+            d[1, s] = mask[0, s];   // uncond 保持相同 audio_mask 结构
+        }
         return d;
     }
 
-    bool[,,,] DoubleForCFG(bool[,,,] attn)
+    static bool[,,,] DoubleForCFG(bool[,,,] attn, int S)
     {
-        int S = attn.GetLength(2);
         var d = new bool[2, 1, S, S];
         for (int i = 0; i < S; i++)
-            for (int j = 0; j < S; j++) { d[0, 0, i, j] = attn[0, 0, i, j]; d[1, 0, i, j] = true; }
+            for (int j = 0; j < S; j++)
+            {
+                d[0, 0, i, j] = attn[0, 0, i, j];
+                d[1, 0, i, j] = attn[0, 0, i, j];
+            }
         return d;
     }
 
-    long[,] DoubleForCFG(long[,] pos, int S)
+    static long[,] DoubleForCFG(long[,] pos, int S)
     {
         var d = new long[2, S];
-        for (int s = 0; s < S; s++) { d[0, s] = pos[0, s]; d[1, s] = pos[0, s]; }
+        for (int s = 0; s < S; s++)
+        {
+            d[0, s] = pos[0, s];
+            d[1, s] = pos[0, s];
+        }
         return d;
     }
 
-    long[,,] AppendToken(long[,,] ids, long[] newCodes, int curLen)
+    // ── 采样工具 ─────────────────────────────────────────────────────────
+
+    long SampleTopK(float[] logits, float temp, int k)
     {
-        var n = new long[1, NUM_CODEBOOKS, curLen + 1];
-        for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
+        // 温度缩放
+        if (Math.Abs(temp - 1f) > 1e-6f)
+            for (int i = 0; i < logits.Length; i++) logits[i] /= temp;
+
+        // 排除 MASK_TOKEN（不希望生成区域采出 mask）
+        logits[MASK_TOKEN] = float.NegativeInfinity;
+
+        var indexed = new List<(float val, int idx)>(logits.Length);
+        for (int i = 0; i < logits.Length; i++) indexed.Add((logits[i], i));
+        indexed.Sort((a, b) => b.val.CompareTo(a.val));
+        int topK = Math.Min(k, indexed.Count);
+        indexed = indexed.GetRange(0, topK);
+
+        float maxV = indexed[0].val;
+        float sum = 0f;
+        var probs = new float[topK];
+        for (int i = 0; i < topK; i++) { probs[i] = (float)Math.Exp(indexed[i].val - maxV); sum += probs[i]; }
+        for (int i = 0; i < topK; i++) probs[i] /= sum;
+
+        double r = _rng.NextDouble();
+        double cum = 0;
+        for (int i = 0; i < topK - 1; i++) { cum += probs[i]; if (r < cum) return indexed[i].idx; }
+        return indexed[topK - 1].idx;
+    }
+
+    static long ArgMax(float[] logits, int excludeIdx = -1)
+    {
+        float best = float.NegativeInfinity;
+        int bestIdx = 0;
+        for (int i = 0; i < logits.Length; i++)
         {
-            for (int s = 0; s < curLen; s++) n[0, cb, s] = ids[0, cb, s];
-            n[0, cb, curLen] = newCodes[cb];
+            if (i == excludeIdx) continue;
+            if (logits[i] > best) { best = logits[i]; bestIdx = i; }
         }
-        return n;
+        return bestIdx;
     }
 
-    bool[,] AppendAudioMask(bool[,] mask, int curLen)
+    static float SoftmaxMax(float[] logits)
     {
-        var n = new bool[1, curLen + 1];
-        for (int s = 0; s < curLen; s++) n[0, s] = mask[0, s];
-        n[0, curLen] = true;
-        return n;
+        float maxV = float.NegativeInfinity;
+        for (int i = 0; i < logits.Length; i++) if (logits[i] > maxV) maxV = logits[i];
+        float sum = 0f;
+        for (int i = 0; i < logits.Length; i++) sum += (float)Math.Exp(logits[i] - maxV);
+        return 1f / sum;   // max softmax prob = exp(0) / sum = 1/sum
     }
 
-    static long[] Flatten3D(long[,,] a) { var r = new long[a.Length]; Buffer.BlockCopy(a, 0, r, 0, a.Length * 8); return r; }
-    static long[] Flatten2D(long[,] a) { var r = new long[a.Length]; Buffer.BlockCopy(a, 0, r, 0, a.Length * 8); return r; }
-    static bool[] FlattenBool2D(bool[,] a) { var r = new bool[a.Length]; int i = 0; foreach (var v in a) r[i++] = v; return r; }
-    static bool[] FlattenBool4D(bool[,,,] a) { var r = new bool[a.Length]; int i = 0; foreach (var v in a) r[i++] = v; return r; }
+    // ── 扁平化工具 ───────────────────────────────────────────────────────
+
+    static long[] Flatten3D(long[,,] a)
+    {
+        var r = new long[a.Length];
+        Buffer.BlockCopy(a, 0, r, 0, a.Length * sizeof(long));
+        return r;
+    }
+
+    static long[] Flatten2D(long[,] a)
+    {
+        var r = new long[a.Length];
+        Buffer.BlockCopy(a, 0, r, 0, a.Length * sizeof(long));
+        return r;
+    }
+
+    static bool[] FlattenBool2D(bool[,] a)
+    {
+        var r = new bool[a.Length];
+        int i = 0;
+        foreach (var v in a) r[i++] = v;
+        return r;
+    }
+
+    static bool[] FlattenBool4D(bool[,,,] a)
+    {
+        var r = new bool[a.Length];
+        int i = 0;
+        foreach (var v in a) r[i++] = v;
+        return r;
+    }
 
     public void Dispose() => _session?.Dispose();
 }

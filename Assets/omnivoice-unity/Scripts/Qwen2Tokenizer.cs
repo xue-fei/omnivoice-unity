@@ -283,40 +283,101 @@ public class Qwen2Tokenizer
     }
 
     /// <summary>
-    /// 构建 OmniVoice prompt。Special token ID 优先从 tokenizer.json 读取，fallback 到硬编码。
+    /// 构建 OmniVoice prompt，与 Python _prepare_inference_inputs 对齐。
+    ///
+    /// Python 结构：
+    ///   style_text = [&lt;|denoise|>] + &lt;|lang_start|>{lang}&lt;|lang_end|> + &lt;|instruct_start|>{instruct}&lt;|instruct_end|>
+    ///   text_tokens = &lt;|text_start|>{combined_text}&lt;|text_end|>
+    ///
+    /// 关键对齐点：
+    ///   1. denoise 仅在有参考音频时添加（Python: if denoise and ref_audio_tokens is not None）
+    ///   2. instruct 段始终存在，None 时文本为 "None"（Python: instruct_str = instruct if instruct else "None"）
+    ///   3. text 区域使用 CombineText(refText, text) 合并（Python: _combine_text）
     /// </summary>
-    public int[] BuildPrompt(string text, string language = "Chinese", string instruct = null)
+    public int[] BuildPrompt(string text, string language = "Chinese",
+                             string instruct = null, string refText = null,
+                             bool hasRefAudio = false)
     {
         var ids = new List<int>();
 
         int GetId(string key, int fallback) => _specialTokens.TryGetValue(key, out int id) ? id : fallback;
 
-        int denoise = GetId("|<|denoise|>", TOKEN_DENOISE);
-        int langStart = GetId("|<|lang_start|>", TOKEN_LANG_START);
-        int langEnd = GetId("|<|lang_end|>", TOKEN_LANG_END);
-        int instructStart = GetId("|<|instruct_start|>", TOKEN_INSTRUCT_START);
-        int instructEnd = GetId("|<|instruct_end|>", TOKEN_INSTRUCT_END);
-        int textStart = GetId("|<|text_start|>", TOKEN_TEXT_START);
-        int textEnd = GetId("|<|text_end|>", TOKEN_TEXT_END);
+        // 修复 special token 查找键名：Qwen2 格式为 <|xxx|>，不是 |<|xxx|>
+        int denoise = GetId("<|denoise|>", TOKEN_DENOISE);
+        int langStart = GetId("<|lang_start|>", TOKEN_LANG_START);
+        int langEnd = GetId("<|lang_end|>", TOKEN_LANG_END);
+        int instructStart = GetId("<|instruct_start|>", TOKEN_INSTRUCT_START);
+        int instructEnd = GetId("<|instruct_end|>", TOKEN_INSTRUCT_END);
+        int textStart = GetId("<|text_start|>", TOKEN_TEXT_START);
+        int textEnd = GetId("<|text_end|>", TOKEN_TEXT_END);
 
-        ids.Add(denoise);
+        // ── Style 段 ──
+        // Python: if denoise and ref_audio_tokens is not None: style_text += "<|denoise|>"
+        if (hasRefAudio)
+            ids.Add(denoise);
+
+        // Python: style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
+        string langStr = !string.IsNullOrEmpty(language) ? language : "None";
         ids.Add(langStart);
-        ids.AddRange(EncodeText(language));
+        ids.AddRange(EncodeText(langStr));
         ids.Add(langEnd);
 
-        if (!string.IsNullOrEmpty(instruct))
-        {
-            ids.Add(instructStart);
-            ids.AddRange(EncodeText(instruct));
-            ids.Add(instructEnd);
-        }
+        // Python: style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+        // 关键：instruct 段始终存在，None 时文本为 "None"
+        string instructStr = !string.IsNullOrEmpty(instruct) ? instruct : "None";
+        ids.Add(instructStart);
+        ids.AddRange(EncodeText(instructStr));
+        ids.Add(instructEnd);
 
+        // ── Text 段 ──
+        // Python: full_text = _combine_text(ref_text=ref_text, text=text)
+        //         wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
+        string combinedText = CombineText(text, refText);
         ids.Add(textStart);
-        ids.AddRange(EncodeText(text));
+        ids.AddRange(EncodeText(combinedText));
         ids.Add(textEnd);
 
         return ids.ToArray();
     }
+
+    /// <summary>
+    /// 合并参考文本和目标文本，与 Python _combine_text 对齐。
+    ///
+    /// Python 逻辑：
+    ///   1. ref_text + " " + text（若有 ref_text）
+    ///   2. 过滤 \r\n
+    ///   3. 中文括号 → 英文括号
+    ///   4. 合并连续空格
+    ///   5. 移除中文字符周围的空格
+    /// </summary>
+    public static string CombineText(string text, string refText = null)
+    {
+        // 1. 合并 ref_text + text
+        string fullText;
+        if (!string.IsNullOrEmpty(refText))
+            fullText = refText.Trim() + " " + text.Trim();
+        else
+            fullText = text.Trim();
+
+        // 2. 过滤 \r\n
+        fullText = CRNLRegex.Replace(fullText, "");
+
+        // 3. 中文括号 → 英文括号
+        fullText = fullText.Replace('\uff08', '(').Replace('\uff09', ')');
+
+        // 4. 合并连续空格/Tab
+        fullText = MultiSpaceRegex.Replace(fullText, " ");
+
+        // 5. 移除中文字符周围的空格
+        fullText = CJSurroundSpaceRegex.Replace(fullText, "");
+
+        return fullText;
+    }
+
+    static readonly Regex CRNLRegex = new Regex(@"[\r\n]+", RegexOptions.Compiled);
+    static readonly Regex MultiSpaceRegex = new Regex(@"[ \t]+", RegexOptions.Compiled);
+    static readonly Regex CJSurroundSpaceRegex = new Regex(
+        @"(?<=[\u4e00-\u9fff])\s+|\s+(?=[\u4e00-\u9fff])", RegexOptions.Compiled);
 
     public bool TryGetSpecialToken(string content, out int id) =>
         _specialTokens.TryGetValue(content, out id);

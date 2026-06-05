@@ -7,6 +7,8 @@ public class OmniVoiceRunner : MonoBehaviour
 {
     [Header("音频设置")]
     public AudioClip referenceAudio;
+    [Tooltip("参考音频的文字内容（语音克隆模式需要）。留空则不合并到文本段。")]
+    public string referenceText = "";
     [TextArea] public string targetText = "你好，这是使用语音克隆生成的音频。";
     public string targetLanguage = "Chinese";
     public AudioSource outputAudioSource;
@@ -24,10 +26,12 @@ public class OmniVoiceRunner : MonoBehaviour
     public float guidanceScale = 2.0f;
     [Tooltip("调度时移 τ，原版默认 0.1")]
     public float tShift = 0.1f;
-    [Tooltip("mask 位置选择温度，原版默认 5.0")]
-    public float maskTemperature = 5.0f;
-    [Tooltip("层惩罚系数，原版约 1.0；旧版 5.0 过强会导致高层 codebook 不解 mask")]
-    public float layerPenaltyFactor = 1.0f;
+    [Tooltip("position_temperature: 位置选择温度，原版默认 5.0")]
+    public float positionTemperature = 5.0f;
+    [Tooltip("class_temperature: token 采样温度，原版默认 0.0（greedy argmax）；>0 时使用 top-k ratio + Gumbel")]
+    public float classTemperature = 0.0f;
+    [Tooltip("层惩罚系数，原版默认 5.0；控制 codebook 从低到高逐层解 mask")]
+    public float layerPenaltyFactor = 5.0f;
     [Tooltip("目标生成时长（秒）。0 = 按文字长度自动估算")]
     public float targetDurSec = 0f;
 
@@ -48,7 +52,8 @@ public class OmniVoiceRunner : MonoBehaviour
             NumStep = numStep,
             GuidanceScale = guidanceScale,
             TShift = tShift,
-            MaskTemperature = maskTemperature,
+            PositionTemperature = positionTemperature,
+            ClassTemperature = classTemperature,
             LayerPenaltyFactor = layerPenaltyFactor,
         };
 
@@ -110,11 +115,18 @@ public class OmniVoiceRunner : MonoBehaviour
         }
 
         // 2. 构建文本 prompt
+        //    与 Python _prepare_inference_inputs 对齐：
+        //    - hasRefAudio: 控制是否添加 <|denoise|> token
+        //    - refText: 合并到文本段（_combine_text）
         int[] textTokenIds;
+        bool hasRefAudio = referenceAudio != null;
+        string refTextStr = hasRefAudio && !string.IsNullOrEmpty(referenceText) ? referenceText : null;
+
         if (_textTok != null && !string.IsNullOrEmpty(targetText))
         {
-            textTokenIds = _textTok.BuildPrompt(targetText, targetLanguage);
-            Debug.Log($"[OmniVoiceRunner] 文本 prompt: {textTokenIds.Length} tokens");
+            textTokenIds = _textTok.BuildPrompt(targetText, targetLanguage, instruct: null,
+                                                 refText: refTextStr, hasRefAudio: hasRefAudio);
+            Debug.Log($"[OmniVoiceRunner] 文本 prompt: {textTokenIds.Length} tokens (hasRefAudio={hasRefAudio}, refText={refTextStr != null})");
         }
         else
         {

@@ -9,3 +9,4 @@ Temp
 *.dwlt
 .vs
 obj
+Omnivoice-onnx

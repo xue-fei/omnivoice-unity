@@ -3,7 +3,9 @@
 //
 // 与 Python 对齐的关键修改：
 //   1. CFG batch：uncond 分支仅保留生成区域，其余 PAD（匹配 Python）
-//   2. CFG log_probs：添加二次 log_softmax（Python: log_softmax(cfg)）
+//   2. CFG log_probs：
+//      ★ 公式：log_softmax(c + scale*(c - u))，基准为 c_log_probs
+//        （原先错误地使用 u + scale*(c-u)）
 //   3. MASK_TOKEN 的 log_prob 设为 -inf（Python: log_probs[..., mask_id] = -inf）
 //   4. Token 采样：ClassTemperature=0.0（greedy argmax，匹配 Python 默认）
 //      ClassTemperature>0 时使用 top-k ratio(0.1) + Gumbel 采样
@@ -238,10 +240,11 @@ public class OmniVoiceLM : IDisposable
                     // Python: u_log_probs = log_softmax(u_logits)
                     float[] uncondLSM = LogSoftmax(uncondLogits);
 
-                    // Python: log_softmax(c_log_probs + scale * (c - u))
+                    // Python: log_softmax(c_log_probs + guidance_scale * (c_log_probs - u_log_probs))
+                    // ★ 修复：基准是 c_log_probs，不是 u_log_probs
                     var cfgValues = new float[VOCAB_SIZE];
                     for (int v = 0; v < VOCAB_SIZE; v++)
-                        cfgValues[v] = uncondLSM[v] + GuidanceScale * (condLSM[v] - uncondLSM[v]);
+                        cfgValues[v] = condLSM[v] + GuidanceScale * (condLSM[v] - uncondLSM[v]);
                     float[] finalLSM = LogSoftmax(cfgValues);
 
                     // Python: log_probs[..., audio_mask_id] = -inf
@@ -320,20 +323,19 @@ public class OmniVoiceLM : IDisposable
 
         // ── uncond 分支（b=1）：生成区在前 [0, targetLen)，其余 PAD ──
         // Python: batch_input_ids[B+i, :, :u_len] = inp["input_ids"][..., -u_len:]
+        //         batch_audio_mask[B+i, :u_len] = inp["audio_mask"][..., -u_len:]
+        // audio mask 与 codebook 无关，先统一设置
+        for (int t = 0; t < targetLen; t++) audio[1, t] = true;
+        for (int s = targetLen; s < S; s++) audio[1, s] = false;
+
         for (int cb = 0; cb < NUM_CODEBOOKS; cb++)
         {
             // 生成区：从 cond 的 [genStart, S) 拷贝到 uncond 的 [0, targetLen)
             for (int t = 0; t < targetLen; t++)
-            {
                 ids[1, cb, t] = srcIds[0, cb, genStart + t];
-                audio[1, t] = true;  // 生成区 audioMask = true
-            }
-            // 填充区：MASK_TOKEN, audioMask = false
+            // 填充区：MASK_TOKEN
             for (int s = targetLen; s < S; s++)
-            {
                 ids[1, cb, s] = MASK_TOKEN;
-                audio[1, s] = false;
-            }
         }
 
         // uncond 的 attention mask：

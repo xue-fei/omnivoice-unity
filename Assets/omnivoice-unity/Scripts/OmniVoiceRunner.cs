@@ -90,13 +90,28 @@ public class OmniVoiceRunner : MonoBehaviour
         // 1. 编码参考音频
         long[,] refCodes = null;
         int T_ref = 0;
+        float refRms = -1f; // -1 表示无参考音频
         if (referenceAudio != null)
         {
             float[] refPCM = AudioUtils.AudioClipToPCM(referenceAudio);
+
+            // ★ 修复：对齐 Python create_voice_clone_prompt：
+            //   ref_rms = sqrt(mean(ref_wav^2))
+            //   if 0 < ref_rms < 0.1: ref_wav = ref_wav * 0.1 / ref_rms
+            refRms = 0f;
+            foreach (float s in refPCM) refRms += s * s;
+            refRms = Mathf.Sqrt(refRms / refPCM.Length);
+            if (refRms > 0f && refRms < 0.1f)
+            {
+                float scale = 0.1f / refRms;
+                for (int i = 0; i < refPCM.Length; i++) refPCM[i] *= scale;
+                Debug.Log($"[OmniVoiceRunner] 参考音频 RMS 归一化: {refRms:F4} → 0.1 (×{scale:F2})");
+            }
+
             refCodes = _tokenizer.Encode(refPCM);
             T_ref = refCodes.GetLength(1);
             float refDur = T_ref * 960f / 24000f;
-            Debug.Log($"[OmniVoiceRunner] 参考音频原始: {refDur:F1}s ({T_ref} 帧)");
+            Debug.Log($"[OmniVoiceRunner] 参考音频原始: {refDur:F1}s ({T_ref} 帧)  RMS={refRms:F4}");
 
             // ★ 修复：截断参考音频到 6 秒（约 150 帧），避免过长参考干扰开头生成
             const int MAX_REF_FRAMES = 150; // 6s @ 25fps
@@ -168,8 +183,23 @@ public class OmniVoiceRunner : MonoBehaviour
         // 5. 解码
         float[] pcm = _tokenizer.Decode(generatedCodes);
 
-        // 6. 后处理
-        AudioUtils.NormalizeRMS(pcm);
+        // 6. 后处理（对齐 Python _post_process_audio）
+        // ★ 修复：有参考音频且 ref_rms < 0.1 时恢复原始音量；否则峰值归一化到 0.5
+        if (refRms >= 0f && refRms < 0.1f)
+        {
+            // Python: if ref_rms < 0.1: audio = audio * ref_rms / 0.1
+            float restoreScale = refRms / 0.1f;
+            for (int i = 0; i < pcm.Length; i++) pcm[i] *= restoreScale;
+        }
+        else if (refRms < 0f)
+        {
+            // 无参考音频：峰值归一化到 0.5（Python: audio / peak * 0.5）
+            float peak = 0f;
+            foreach (float s in pcm) { float abs = Mathf.Abs(s); if (abs > peak) peak = abs; }
+            if (peak > 1e-6f)
+                for (int i = 0; i < pcm.Length; i++) pcm[i] = pcm[i] / peak * 0.5f;
+        }
+        // ref_rms >= 0.1 时音量已正常，不做缩放
         AudioUtils.ApplyFade(pcm);
 
         float elapsed = Time.realtimeSinceStartup - t0;
@@ -193,7 +223,15 @@ public class OmniVoiceRunner : MonoBehaviour
         if (string.IsNullOrEmpty(text))
             return T_ref > 0 ? T_ref : 100;
 
-        bool isChinese = language.IndexOf("Chinese", StringComparison.OrdinalIgnoreCase) >= 0;
+        // ★ 修复：先将语言名解析为 ID（"Chinese" → "zh"），再判断是否中文
+        string resolvedLang = _textTok != null
+            ? Qwen2Tokenizer.ResolveLang(language)
+            : language;
+        bool isChinese = resolvedLang.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+                      || resolvedLang.StartsWith("yue", StringComparison.OrdinalIgnoreCase)
+                      || resolvedLang.StartsWith("wuu", StringComparison.OrdinalIgnoreCase)
+                      || resolvedLang.StartsWith("nan", StringComparison.OrdinalIgnoreCase);
+
         float durSec;
         if (isChinese)
         {
@@ -210,8 +248,8 @@ public class OmniVoiceRunner : MonoBehaviour
 
         durSec = Mathf.Clamp(durSec, 1.0f, 30.0f);
         int frames = Mathf.RoundToInt(durSec * 24000f / 960f);
-        if (T_ref > 0)
-            frames = Mathf.Min(frames, T_ref * 3);
+        // ★ 修复：移除 T_ref * 3 的硬上限（该限制缺乏依据，会截断长文本生成）
+        //   Python 端通过 RuleDurationEstimator 估算，无此限制
         return Mathf.Max(frames, 25);
     }
 }

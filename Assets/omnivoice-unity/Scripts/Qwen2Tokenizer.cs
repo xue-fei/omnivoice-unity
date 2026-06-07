@@ -316,8 +316,10 @@ public class Qwen2Tokenizer
         if (hasRefAudio)
             ids.Add(denoise);
 
+        // Python: lang_str = lang if lang else "None"
+        // ★ 修复：语言名称需先解析为 ID（"Chinese" → "zh"），对齐 Python _resolve_language
+        string langStr = ResolveLang(!string.IsNullOrEmpty(language) ? language : "None");
         // Python: style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
-        string langStr = !string.IsNullOrEmpty(language) ? language : "None";
         ids.Add(langStart);
         ids.AddRange(EncodeText(langStr));
         ids.Add(langEnd);
@@ -378,6 +380,54 @@ public class Qwen2Tokenizer
     static readonly Regex MultiSpaceRegex = new Regex(@"[ \t]+", RegexOptions.Compiled);
     static readonly Regex CJSurroundSpaceRegex = new Regex(
         @"(?<=[\u4e00-\u9fff])\s+|\s+(?=[\u4e00-\u9fff])", RegexOptions.Compiled);
+
+    // ---------------------------------------------------------------------------
+    // 语言名称 → ID 映射（对齐 Python omnivoice/utils/lang_map.py LANG_NAME_TO_ID）
+    // ---------------------------------------------------------------------------
+    static readonly Dictionary<string, string> LangNameToId =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "chinese",        "zh" }, { "mandarin",       "zh" },
+            { "english",        "en" }, { "japanese",        "ja" },
+            { "korean",         "ko" }, { "french",          "fr" },
+            { "german",         "de" }, { "spanish",         "es" },
+            { "portuguese",     "pt" }, { "italian",         "it" },
+            { "dutch",          "nl" }, { "russian",         "ru" },
+            { "arabic",         "ar" }, { "hindi",           "hi" },
+            { "thai",           "th" }, { "vietnamese",      "vi" },
+            { "indonesian",     "id" }, { "malay",           "ms" },
+            { "catalan",        "ca" }, { "czech",           "cs" },
+            { "danish",         "da" }, { "finnish",         "fi" },
+            { "greek",          "el" }, { "hungarian",       "hu" },
+            { "norwegian",      "no" }, { "polish",          "pl" },
+            { "romanian",       "ro" }, { "slovak",          "sk" },
+            { "swedish",        "sv" }, { "turkish",         "tr" },
+            { "ukrainian",      "uk" }, { "cantonese",       "yue" },
+            { "shanghainese",   "wuu" }, { "taiwanese hokkien", "nan" },
+            { "tibetan",        "bo" }, { "uyghur",          "ug" },
+        };
+
+    /// <summary>
+    /// 将语言名称或 ID 解析为标准语言 ID（对齐 Python _resolve_language）。
+    /// 若无法识别则返回原值（Python 中会 fallback 到 None，这里返回原值以保留 token）。
+    /// </summary>
+    public static string ResolveLang(string language)
+    {
+        if (string.IsNullOrEmpty(language) ||
+            language.Equals("None", StringComparison.OrdinalIgnoreCase))
+            return "None";
+
+        // 已经是短代码（2-3 字符），直接使用
+        if (language.Length <= 3) return language;
+
+        // 全名映射
+        if (LangNameToId.TryGetValue(language, out string id))
+            return id;
+
+        // 无法识别，保留原值（与 Python 降级行为一致，让模型忽略）
+        Debug.LogWarning($"[Qwen2Tokenizer] 未知语言名称 '{language}'，直接传入模型（可能降级为语言无关模式）");
+        return language;
+    }
 
     public bool TryGetSpecialToken(string content, out int id) =>
         _specialTokens.TryGetValue(content, out id);

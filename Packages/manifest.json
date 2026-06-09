@@ -4,7 +4,7 @@
     "com.unity.toolchain.win-x86_64-linux-x86_64": "2.0.11",
     "com.unity.ugui": "1.0.0",
     "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git",
-    "onnxruntime-directml": "https://github.com/xue-fei/onnxruntime-unity-directml.git",
+    "onnxruntime-cuda": "https://github.com/xue-fei/onnxruntime-unity-cuda.git",
     "com.unity.modules.ai": "1.0.0",
     "com.unity.modules.androidjni": "1.0.0",
     "com.unity.modules.animation": "1.0.0",

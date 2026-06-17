@@ -48,6 +48,8 @@ public class OmniVoiceRunner : MonoBehaviour
 
     void Start()
     {
+        Application.targetFrameRate = 60;
+
         string lmPath = Path.Combine(Application.streamingAssetsPath, lmModelRelPath);
         string encPath = Path.Combine(Application.streamingAssetsPath, encModelRelPath);
         string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
@@ -118,10 +120,12 @@ public class OmniVoiceRunner : MonoBehaviour
             float refDur = T_ref * 960f / 24000f;
             Debug.Log($"[OmniVoiceRunner] 参考音频: {refDur:F1}s ({T_ref} 帧)  RMS={refRms:F4}");
 
-            const int MAX_REF_FRAMES = 150;
+            // Python 参考实现最长允许 ~20s（500 帧）；之前 150 帧（6s）过于保守，
+            // 会导致参考语速基准帧数过少，EstimateTargetLen 估算偏差加大。
+            const int MAX_REF_FRAMES = 500;
             if (T_ref > MAX_REF_FRAMES)
             {
-                Debug.LogWarning($"[OmniVoiceRunner] 参考音频过长，截断至 {MAX_REF_FRAMES} 帧 (6s)");
+                Debug.LogWarning($"[OmniVoiceRunner] 参考音频过长，截断至 {MAX_REF_FRAMES} 帧 (20s)");
                 var truncated = new long[OmniVoiceLM.NUM_CODEBOOKS, MAX_REF_FRAMES];
                 for (int cb = 0; cb < OmniVoiceLM.NUM_CODEBOOKS; cb++)
                     for (int t = 0; t < MAX_REF_FRAMES; t++)
@@ -133,14 +137,15 @@ public class OmniVoiceRunner : MonoBehaviour
             if (refDur < 2f) Debug.LogWarning("参考音频过短（< 2s），克隆质量可能较差");
         }
 
-        // 2. 构建文本 prompt
+        // 2. 构建文本 prompt 
         int[] textTokenIds;
         bool hasRefAudio = referenceAudio != null;
         string refTextStr = hasRefAudio && !string.IsNullOrEmpty(referenceText) ? referenceText : null;
-
-        if (_textTok != null && !string.IsNullOrEmpty(targetText))
+        string normalizedTarget = TextNormalizer.Normalize(targetText);
+        Debug.Log("normalizedTarget:"+ normalizedTarget);
+        if (_textTok != null && !string.IsNullOrEmpty(normalizedTarget))
         {
-            textTokenIds = _textTok.BuildPrompt(targetText, targetLanguage, instruct: null,
+            textTokenIds = _textTok.BuildPrompt(normalizedTarget, targetLanguage, instruct: null,
                                                 refText: refTextStr, hasRefAudio: hasRefAudio);
             Debug.Log($"[OmniVoiceRunner] 文本 prompt: {textTokenIds.Length} tokens " +
                       $"(hasRefAudio={hasRefAudio}, refText={refTextStr != null})");
@@ -151,7 +156,7 @@ public class OmniVoiceRunner : MonoBehaviour
         }
 
         // 3. 估算目标帧数
-        int targetLen = EstimateTargetLen(targetText, targetLanguage, T_ref);
+        int targetLen = EstimateTargetLen(normalizedTarget, targetLanguage, T_ref);
         Debug.Log($"[OmniVoiceRunner] 目标帧数: {targetLen} ({targetLen * 960f / 24000f:F1}s)");
 
         // 4. 后台线程推理
@@ -198,7 +203,10 @@ public class OmniVoiceRunner : MonoBehaviour
             if (peak > 1e-6f)
                 for (int i = 0; i < pcm.Length; i++) pcm[i] = pcm[i] / peak * 0.5f;
         }
-        AudioUtils.ApplyFade(pcm);
+        // ★ 修复：生成音频只做淡出，不做淡入。
+        // 淡入会把模型对音频开头 token 的预测（置信度本就偏低）静音掉，
+        // 导致"无参考文字时音频开头缺失"的问题。
+        AudioUtils.ApplyFadeOut(pcm);
 
         float elapsed = Time.realtimeSinceStartup - t0;
         float audioDur = pcm.Length / 24000f;

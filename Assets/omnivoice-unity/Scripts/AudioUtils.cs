@@ -1,8 +1,6 @@
 using System;
 using System.IO;
 using UnityEngine;
-using UnityEngine.Networking;
-using System.Collections;
 
 public static class AudioUtils
 {
@@ -106,7 +104,7 @@ public static class AudioUtils
     }
 
     /// <summary>
-    /// 简单的淡入淡出（避免爆音）
+    /// 淡入 + 淡出（用于参考音频等需要双向平滑的场景）
     /// </summary>
     public static void ApplyFade(float[] pcm, int fadeSamples = 480)
     {
@@ -115,6 +113,19 @@ public static class AudioUtils
         {
             float t = (float)i / f;
             pcm[i] *= t;
+            pcm[pcm.Length - 1 - i] *= t;
+        }
+    }
+
+    /// <summary>
+    /// 仅淡出（用于生成音频，避免把模型对开头的预测用淡入静音掉）
+    /// </summary>
+    public static void ApplyFadeOut(float[] pcm, int fadeSamples = 480)
+    {
+        int f = Math.Min(fadeSamples, pcm.Length / 4);
+        for (int i = 0; i < f; i++)
+        {
+            float t = (float)i / f;
             pcm[pcm.Length - 1 - i] *= t;
         }
     }

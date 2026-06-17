@@ -194,7 +194,9 @@ public class OmniVoiceLM : IDisposable
             else
             {
                 double kRatio = r[step + 1] - r[step];
-                kNew = (int)Math.Ceiling(kRatio * totalMasks);
+                // ★ 修复：与 Python math.ceil(total_mask * delta) 对齐使用 Round，
+                // Ceiling 会在前几步解掉过多 token，导致高层 codebook 优先级失衡。
+                kNew = (int)Math.Round(kRatio * totalMasks);
                 kNew = Math.Min(kNew, remMasks);
             }
 

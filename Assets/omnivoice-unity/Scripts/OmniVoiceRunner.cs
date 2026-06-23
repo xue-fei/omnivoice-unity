@@ -21,7 +21,7 @@ public class OmniVoiceRunner : MonoBehaviour
 
     [Header("推理加速（EP 选择）")]
     [Tooltip("CUDA = NVIDIA GPU；DML = DirectML (Windows/AMD/Intel)；CPU = 纯 CPU 多线程")]
-    public OmniVoiceLM.ExecutionProviderType executionProvider = OmniVoiceLM.ExecutionProviderType.CUDA;
+    public ExecutionProviderType executionProvider = ExecutionProviderType.CUDA;
     [Tooltip("GPU device index，多卡环境可指定")]
     public int deviceId = 0;
 
@@ -66,7 +66,7 @@ public class OmniVoiceRunner : MonoBehaviour
             LayerPenaltyFactor = layerPenaltyFactor,
         };
 
-        _tokenizer = new AudioTokenizer(encPath, decPath);
+        _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);
 
         if (File.Exists(tokPath))
         {
@@ -142,7 +142,7 @@ public class OmniVoiceRunner : MonoBehaviour
         bool hasRefAudio = referenceAudio != null;
         string refTextStr = hasRefAudio && !string.IsNullOrEmpty(referenceText) ? referenceText : null;
         string normalizedTarget = TextNormalizer.Normalize(targetText);
-        Debug.Log("normalizedTarget:"+ normalizedTarget);
+        Debug.Log("normalizedTarget:" + normalizedTarget);
         if (_textTok != null && !string.IsNullOrEmpty(normalizedTarget))
         {
             textTokenIds = _textTok.BuildPrompt(normalizedTarget, targetLanguage, instruct: null,

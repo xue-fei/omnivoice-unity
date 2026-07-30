@@ -23,6 +23,17 @@ using UnityEngine;
 ///   [OPT-4] IsCorrupted 改为采样检测（检查量降低 ~99%）
 ///   [OPT-5] 一维数组替代多维数组（消除边界检查开销）
 ///   [OPT-6] SampleTokenTopKRatio 用 QuickSelect 替代全排序（O(n) 替代 O(n·log n)）
+///   [OPT-7] IOBinding 替代 NamedOnnxValue.Run()：
+///           - 输入/输出 OrtValue 直接包裹复用的托管数组，地址在整个 Generate() 调用内保持不变
+///           - 输出直接写入 _rawLogitsBuf，彻底取代 OPT-1 的反射拷贝
+///           - 可选开启 CUDA Graph（enable_cuda_graph）：同一 Generate() 调用内 32 步 forward
+///             shape 完全相同，首步 capture、后续步骤 replay，消除逐步 kernel launch 开销
+///           - 失败自动回退旧的 NamedOnnxValue.Run() 路径，不影响正确性
+/// 
+/// 尚未做（需要模型/架构层面配合，本次未改动）：
+///   - 序列长度分桶（跨 Generate() 调用复用 CUDA Graph）：需要同步改造 attention mask，
+///     避免 padding 区域被 cond 分支的全 1 注意力污染真实 token，暂缓实现
+///   - lm_head 只对生成区位置投影（ONNX 导出层面裁剪），可省去 (S-targetLen) 比例的算力
 /// </summary>
 public class OmniVoiceLM : IDisposable
 {
@@ -51,6 +62,34 @@ public class OmniVoiceLM : IDisposable
 
     /// <summary>随机数生成器（用于 Gumbel 采样）</summary>
     System.Random _rng;
+
+    // ════════════════════════════════════════════════════════════════
+    // [OPT-7] IOBinding / CUDA Graph 相关状态
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>是否成功初始化 IOBinding（构造时探测，失败则永久回退旧路径）</summary>
+    bool _ioBindingReady;
+
+    /// <summary>复用的 IOBinding 对象</summary>
+    OrtIoBinding _ioBinding;
+
+    /// <summary>IOBinding 用持久 OrtValue —— 输入（与 shape 绑定，shape 变化时重建，每步重新 BindInput 保证数据新鲜）</summary>
+    OrtValue _ovIds, _ovAudio, _ovAttn, _ovPos;
+
+    /// <summary>模型输出节点名（从 session 元数据读取，避免硬编码）</summary>
+    string _outputName;
+
+    /// <summary>复用的 RunOptions（IOBinding 路径下每次 Run 需要，避免每步 new）</summary>
+    RunOptions _runOptions;
+
+    /// <summary>是否请求启用 CUDA Graph（仅在 provider=CUDA 且成功开启 IOBinding 时生效）</summary>
+    bool _enableCudaGraph;
+
+    /// <summary>实际执行提供程序类型（用于判断是否满足 CUDA Graph 前置条件）</summary>
+    ExecutionProviderType _providerType;
+
+    /// <summary>本次 Generate() 内，当前 shape 是否已完成"首步 capture"（仅用于日志提示，不影响逻辑）</summary>
+    bool _cudaGraphCapturedForCurrentShape;
 
     // ════════════════════════════════════════════════════════════════
     // 生成参数
@@ -144,6 +183,12 @@ public class OmniVoiceLM : IDisposable
     /// <summary>候选分数缓冲区（用于 Top-K 排序）</summary>
     (int t, int cb, float score)[] _allScoresBuf;
 
+    /// <summary>
+    /// 分数降序比较器（静态复用，避免 DiffusionStep 每次进入全排序分支都 new 一个 Comparer 包装对象）
+    /// </summary>
+    static readonly Comparer<(int t, int cb, float score)> _scoreDescendingComparer =
+        Comparer<(int t, int cb, float score)>.Create((a, b) => b.score.CompareTo(a.score));
+
     /// <summary>预测 token 缓冲区</summary>
     long[] _predTokensBuf;
 
@@ -197,18 +242,29 @@ public class OmniVoiceLM : IDisposable
     /// <param name="executionProvider">执行提供程序类型（CUDA/DML/CPU）</param>
     /// <param name="deviceId">GPU 设备索引</param>
     /// <param name="seed">随机数种子</param>
+    /// <param name="enableCudaGraph">
+    /// [OPT-7] 是否尝试开启 CUDA Graph（仅 CUDA EP 有效）。
+    /// 默认 false —— 该特性依赖具体 ORT/CUDA 版本，不同版本行为差异较大，
+    /// 建议先在你的实际环境上用 WarmUp() 验证输出无 NaN/Inf 后再开启。
+    /// 开启失败会自动降级为普通 CUDA（不影响正确性，只是拿不到额外加速）。
+    /// </param>
     public OmniVoiceLM(
         string modelPath,
         ExecutionProviderType executionProvider = ExecutionProviderType.CUDA,
         int deviceId = 0,
-        int seed = 42)
+        int seed = 42,
+        bool enableCudaGraph = false)
     {
         _rng = new System.Random(seed);
+        _providerType = executionProvider;
+        _enableCudaGraph = enableCudaGraph && executionProvider == ExecutionProviderType.CUDA;
 
         // 构建 SessionOptions
         var options = new SessionOptions();
         options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
-        options.EnableMemoryPattern = false;   // 动态 shape 场景关闭
+        // 动态 shape 场景关闭；CUDA Graph 模式下 ORT 要求内存地址在 capture 后固定，
+        // EnableMemoryPattern=true 可能导致 arena 重新规划、破坏已 capture 的图，必须保持 false。
+        options.EnableMemoryPattern = false;
         options.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
         options.InterOpNumThreads = 1;
         options.IntraOpNumThreads = 4;
@@ -218,23 +274,56 @@ public class OmniVoiceLM : IDisposable
         // 按优先级尝试 EP：CUDA → DML → CPU
         if (executionProvider == ExecutionProviderType.CUDA)
         {
-            try
+            // [OPT-7] 先尝试带 enable_cuda_graph 的配置，失败（旧版 ORT 不识别该 key /
+            // 硬件不支持）时自动退化为不带该选项的标准 CUDA 配置，最后才回退 CPU。
+            bool cudaGraphActuallyEnabled = false;
+
+            if (_enableCudaGraph)
             {
-                var cudaOptions = new OrtCUDAProviderOptions();
-                cudaOptions.UpdateOptions(new Dictionary<string, string>
+                try
                 {
-                    { "device_id",                 deviceId.ToString() },
-                    { "arena_extend_strategy",     "kSameAsRequested"  },
-                    { "do_copy_in_default_stream", "1"                 },
-                });
-                options.AppendExecutionProvider_CUDA(cudaOptions);
-                executionProviderLoaded = true;
-                Debug.Log($"[OmniVoiceLM] CUDA EP (device={deviceId})");
+                    var cudaOptions = new OrtCUDAProviderOptions();
+                    cudaOptions.UpdateOptions(new Dictionary<string, string>
+                    {
+                        { "device_id",                 deviceId.ToString() },
+                        { "arena_extend_strategy",     "kSameAsRequested"  },
+                        { "do_copy_in_default_stream", "1"                 },
+                        { "enable_cuda_graph",         "1"                 },
+                    });
+                    options.AppendExecutionProvider_CUDA(cudaOptions);
+                    executionProviderLoaded = true;
+                    cudaGraphActuallyEnabled = true;
+                    Debug.Log($"[OmniVoiceLM] CUDA EP + CUDA Graph (device={deviceId})");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[OmniVoiceLM] CUDA Graph 选项不受支持（{ex.Message}），" +
+                                      "回退标准 CUDA EP");
+                }
             }
-            catch (Exception ex)
+
+            if (!executionProviderLoaded)
             {
-                Debug.LogWarning($"[OmniVoiceLM] CUDA EP 失败: {ex.Message}，回退 CPU");
+                try
+                {
+                    var cudaOptions = new OrtCUDAProviderOptions();
+                    cudaOptions.UpdateOptions(new Dictionary<string, string>
+                    {
+                        { "device_id",                 deviceId.ToString() },
+                        { "arena_extend_strategy",     "kSameAsRequested"  },
+                        { "do_copy_in_default_stream", "1"                 },
+                    });
+                    options.AppendExecutionProvider_CUDA(cudaOptions);
+                    executionProviderLoaded = true;
+                    Debug.Log($"[OmniVoiceLM] CUDA EP (device={deviceId})");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[OmniVoiceLM] CUDA EP 失败: {ex.Message}，回退 CPU");
+                }
             }
+
+            _enableCudaGraph = cudaGraphActuallyEnabled;
         }
         else if (executionProvider == ExecutionProviderType.DML)
         {
@@ -259,6 +348,25 @@ public class OmniVoiceLM : IDisposable
 
         _session = new InferenceSession(modelPath, options);
         Debug.Log($"[OmniVoiceLM] 已加载: {modelPath}");
+
+        // [OPT-7] 输出节点名（从元数据读取，避免硬编码 "logits" 之类的名字猜测）
+        _outputName = _session.OutputMetadata.Keys.First();
+
+        // [OPT-7] 尝试初始化 IOBinding；失败则整份代码自动回退到旧的 NamedOnnxValue.Run() 路径
+        try
+        {
+            _ioBinding = _session.CreateIoBinding();
+            _runOptions = new RunOptions();
+            _ioBindingReady = true;
+            Debug.Log("[OmniVoiceLM] IOBinding 初始化成功");
+        }
+        catch (Exception ex)
+        {
+            _ioBindingReady = false;
+            _enableCudaGraph = false;   // 没有 IOBinding 就没法保证地址稳定，CUDA Graph 一并放弃
+            Debug.LogWarning($"[OmniVoiceLM] IOBinding 初始化失败（{ex.Message}），" +
+                              "回退标准 Run() 路径（性能略低，正确性不受影响）");
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -295,29 +403,33 @@ public class OmniVoiceLM : IDisposable
             for (int s = 0; s < sequenceLength; s++)
                 _posBuf[b * sequenceLength + s] = s;
 
-        // 创建 Tensor 和输入列表（修复原始代码中 WarmUp 未初始化 _inputList 的问题）
-        _tIds = new DenseTensor<long>(_idsBuf, new[] { batchSize, NUM_CODEBOOKS, sequenceLength });
-        _tAudio = new DenseTensor<bool>(_audioBuf, new[] { batchSize, sequenceLength });
-        _tAttn = new DenseTensor<bool>(_attnBuf, new[] { batchSize, 1, sequenceLength, sequenceLength });
-        _tPos = new DenseTensor<long>(_posBuf, new[] { batchSize, sequenceLength });
+        // 创建 Tensor / IOBinding（修复原始代码中 WarmUp 未初始化 _inputList 的问题；
+        // 现在与 LMForward 共用同一份重建逻辑，避免两处实现漂移）
+        EnsureTensorsAndBinding(batchSize, sequenceLength);
 
-        _inputList = new List<NamedOnnxValue>
+        // [OPT-7] CUDA Graph 首次 capture 通常发生在第 1 次 Run，之后才是真正的 replay，
+        // 所以预热轮数比原来的 2 次多留一点余量，同时顺带把 capture 开销消化在预热阶段。
+        int warmIterations = _enableCudaGraph ? 4 : 2;
+        for (int i = 0; i < warmIterations; i++)
+            LMForward(batchSize, sequenceLength, _rawLogitsBuf);
+
+        // [OPT-7] CUDA Graph 自检：复用 [OPT-4] 的采样式 NaN/Inf 检测，
+        // 一旦发现异常立刻大声报警——这类问题在 CUDA Graph 场景下最容易"悄悄"发生
+        // （地址复用错误、graph 与实际输入不同步等），生产环境务必看这条日志。
+        if (_enableCudaGraph && IsCorrupted(_rawLogitsBuf))
         {
-            NamedOnnxValue.CreateFromTensor("input_ids",      _tIds),
-            NamedOnnxValue.CreateFromTensor("audio_mask",     _tAudio),
-            NamedOnnxValue.CreateFromTensor("attention_mask", _tAttn),
-            NamedOnnxValue.CreateFromTensor("position_ids",   _tPos),
-        };
+            Debug.LogError("[OmniVoiceLM] ⚠️ CUDA Graph 预热后输出包含 NaN/Inf，" +
+                            "强烈建议将 enableCudaGraph 设为 false 后重新测试，" +
+                            "当前 ORT/CUDA 版本组合可能不兼容该特性。");
+        }
 
-        _tensorS = sequenceLength;
-        _tensorBatch = batchSize;
-
-        // 执行 2 次预热推理
-        for (int i = 0; i < 2; i++)
-            _session.Run(_inputList);
-
+        // 提醒：真实请求的 S（文本+参考音频+目标长度）大概率和这里的预热 S 不同，
+        // 首次真实请求仍会触发一次重建（+CUDA Graph 重新 capture）。如果业务侧
+        // refLength 分布比较集中，建议改用贴近真实分布的 warmupSequenceLength 多跑几次，
+        // 把这部分延迟提前消化掉。
         stopwatch.Stop();
-        Debug.Log($"[OmniVoiceLM] 预热完成 {stopwatch.ElapsedMilliseconds}ms");
+        Debug.Log($"[OmniVoiceLM] 预热完成 {stopwatch.ElapsedMilliseconds}ms " +
+                  $"(IOBinding={_ioBindingReady}, CUDAGraph={_enableCudaGraph})");
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -633,27 +745,78 @@ public class OmniVoiceLM : IDisposable
     /// <param name="outBuf">输出缓冲区</param>
     void LMForward(int batchSize, int sequenceLength, float[] outBuf)
     {
-        // Tensor shape 变化时重建（正常 Generate 内只建一次）
+        // Tensor / IOBinding shape 变化时重建（正常 Generate 内只建一次，32 步复用同一份）
         if (_tensorS != sequenceLength || _tensorBatch != batchSize)
+            EnsureTensorsAndBinding(batchSize, sequenceLength);
+
+        if (_ioBindingReady)
         {
-            _tIds = new DenseTensor<long>(_idsBuf, new[] { batchSize, NUM_CODEBOOKS, sequenceLength });
-            _tAudio = new DenseTensor<bool>(_audioBuf, new[] { batchSize, sequenceLength });
-            _tAttn = new DenseTensor<bool>(_attnBuf, new[] { batchSize, 1, sequenceLength, sequenceLength });
-            _tPos = new DenseTensor<long>(_posBuf, new[] { batchSize, sequenceLength });
+            // ════════════════════════════════════════════════════════
+            // [OPT-7] IOBinding 路径：
+            //   - 输入/输出 OrtValue 对象在 shape 不变时始终是同一个实例，
+            //     直接包裹 _idsBuf/_audioBuf/_attnBuf/_posBuf/_rawLogitsBuf，
+            //     地址在整个 Generate() 调用（32 步）内保持不变 —— 这是
+            //     CUDA Graph 能正确 replay 的前提。
+            //   - ⚠️ 关键点：ORT 的 host→device 拷贝只发生在 BindInput
+            //     被调用的那一刻，不是每次 Run 都会自动重新拷贝。如果只在
+            //     shape 变化时 bind 一次、之后仅修改数组内容而不重新 bind，
+            //     后续步骤会读到第一步的陈旧数据（这是 OrtIoBinding 官方
+            //     文档明确写明的行为，不是本实现的 bug）。所以这里每一步
+            //     都重新 BindInput——同一个 OrtValue 实例，只是重新登记一次，
+            //     开销远小于重建 Tensor/List，但保证了数据新鲜。
+            //   - 输出通过 BindOutputToDevice(CPU) + GetOutputValues() 获取，
+            //     一次 memcpy 拷进 outBuf（见下方），不再需要 OPT-1 的反射逻辑。
+            //   - 若 CUDA Graph 生效，图内只捕获 GPU 侧计算 kernel；host→device
+            //     拷贝本就发生在图外（每次 Run 前），两者不冲突。
+            // ════════════════════════════════════════════════════════
+            _ioBinding.BindInput("input_ids", _ovIds);
+            _ioBinding.BindInput("audio_mask", _ovAudio);
+            _ioBinding.BindInput("attention_mask", _ovAttn);
+            _ioBinding.BindInput("position_ids", _ovPos);
 
-            _inputList = new List<NamedOnnxValue>
+            // 输出：绑定到 CPU 设备（而不是固定 OrtValue），让 ORT 在每次 Run 后
+            // 把结果写到新分配的 OrtValue 里，Run 完成后立刻通过 GetOutputValues()
+            // 取出、拷贝进 outBuf。这样避免了"绑定=拷贝时机"的不确定性——
+            // 保证拿到的永远是这次 Run 算出来的新鲜结果，不会有一次性绑定
+            // 导致的陈旧数据风险。拷贝本身是原生内存到托管数组的 memcpy，
+            // 没有 GC 压力，比原来的反射方案（OPT-1）更快也更简单。
+            _ioBinding.BindOutputToDevice(_outputName, OrtMemoryInfo.DefaultInstance);
+
+            _session.RunWithBinding(_runOptions, _ioBinding);
+
+            // 注意：GetOutputValues() 在不同 ORT 版本里返回类型略有差异（数组 /
+            // IEnumerable / IDisposableReadOnlyCollection 均出现过），这里只依赖
+            // 最通用的 IEnumerable<OrtValue> 接口（LINQ First + foreach），
+            // 不假设它本身实现 IDisposable 或支持索引器，兼容性更好。
+            var boundOutputs = _ioBinding.GetOutputValues();
+            try
             {
-                NamedOnnxValue.CreateFromTensor("input_ids",      _tIds),
-                NamedOnnxValue.CreateFromTensor("audio_mask",     _tAudio),
-                NamedOnnxValue.CreateFromTensor("attention_mask", _tAttn),
-                NamedOnnxValue.CreateFromTensor("position_ids",   _tPos),
-            };
+                var outputValue = boundOutputs.First();
+                var outSpan = outputValue.GetTensorDataAsSpan<float>();
 
-            _tensorS = sequenceLength;
-            _tensorBatch = batchSize;
-            Debug.Log($"[OmniVoiceLM] Tensor 重建: batch={batchSize} S={sequenceLength}");
+                if (outBuf.Length < outSpan.Length)
+                    Debug.LogError($"[OmniVoiceLM] outBuf 太小 {outBuf.Length}<{outSpan.Length}");
+                else
+                    outSpan.CopyTo(outBuf.AsSpan(0, outSpan.Length));
+            }
+            finally
+            {
+                // 每个 OrtValue 都是 ORT 新分配的原生对象，必须逐个释放，否则每步都会泄漏
+                foreach (var ov in boundOutputs) ov?.Dispose();
+            }
+
+            if (!_cudaGraphCapturedForCurrentShape)
+            {
+                _cudaGraphCapturedForCurrentShape = true;
+                if (_enableCudaGraph)
+                    Debug.Log($"[OmniVoiceLM] CUDA Graph 已 capture (batch={batchSize} S={sequenceLength})，后续同 shape 调用将 replay");
+            }
+            return;
         }
 
+        // ════════════════════════════════════════════════════════════
+        // 回退路径：标准 NamedOnnxValue.Run()（IOBinding 初始化失败时使用）
+        // ════════════════════════════════════════════════════════════
         using var results = _session.Run(_inputList);
         var logitsTensor = results[0].AsTensor<float>();
         int length = (int)logitsTensor.Length;
@@ -664,7 +827,7 @@ public class OmniVoiceLM : IDisposable
             return;
         }
 
-        // ── [OPT-1] 零分配拷贝 ──
+        // ── [OPT-1] 零分配拷贝（仅回退路径需要）──
 
         // 首次调用：遍历 DenseTensor<float> 所有非公开字段，找 float[] 类型
         if (!_denseTensorFieldSearched)
@@ -703,6 +866,76 @@ public class OmniVoiceLM : IDisposable
             var array = logitsTensor.ToArray();
             Buffer.BlockCopy(array, 0, outBuf, 0, length * sizeof(float));
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // [OPT-7] EnsureTensorsAndBinding — Tensor / IOBinding 共用重建逻辑
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 在 batchSize / sequenceLength 变化时重建 DenseTensor（旧回退路径用）
+    /// 以及 OrtValue + IOBinding 绑定（新路径用）。
+    /// LMForward 与 WarmUp 共用此方法，避免两处实现漂移。
+    /// </summary>
+    void EnsureTensorsAndBinding(int batchSize, int sequenceLength)
+    {
+        // ── 旧路径：DenseTensor + NamedOnnxValue（IOBinding 失败时的回退始终可用）──
+        _tIds = new DenseTensor<long>(_idsBuf, new[] { batchSize, NUM_CODEBOOKS, sequenceLength });
+        _tAudio = new DenseTensor<bool>(_audioBuf, new[] { batchSize, sequenceLength });
+        _tAttn = new DenseTensor<bool>(_attnBuf, new[] { batchSize, 1, sequenceLength, sequenceLength });
+        _tPos = new DenseTensor<long>(_posBuf, new[] { batchSize, sequenceLength });
+
+        _inputList = new List<NamedOnnxValue>
+        {
+            NamedOnnxValue.CreateFromTensor("input_ids",      _tIds),
+            NamedOnnxValue.CreateFromTensor("audio_mask",     _tAudio),
+            NamedOnnxValue.CreateFromTensor("attention_mask", _tAttn),
+            NamedOnnxValue.CreateFromTensor("position_ids",   _tPos),
+        };
+
+        // ── 新路径：OrtValue 直接包裹同一批复用数组 + IOBinding ──
+        if (_ioBindingReady)
+        {
+            try
+            {
+                _ovIds?.Dispose();
+                _ovAudio?.Dispose();
+                _ovAttn?.Dispose();
+                _ovPos?.Dispose();
+
+                _ovIds = OrtValue.CreateTensorValueFromMemory(
+                    _idsBuf, new long[] { batchSize, NUM_CODEBOOKS, sequenceLength });
+                _ovAudio = OrtValue.CreateTensorValueFromMemory(
+                    _audioBuf, new long[] { batchSize, sequenceLength });
+                _ovAttn = OrtValue.CreateTensorValueFromMemory(
+                    _attnBuf, new long[] { batchSize, 1, sequenceLength, sequenceLength });
+                _ovPos = OrtValue.CreateTensorValueFromMemory(
+                    _posBuf, new long[] { batchSize, sequenceLength });
+
+                // 输出不使用固定 OrtValue：BindOutputToDevice(CPU) 让 ORT 每次 Run 后
+                // 分配新的 CPU 端结果对象，LMForward 里通过 GetOutputValues() 取出。
+                // 清掉上一个 shape 遗留的绑定（避免残留悬空引用）；
+                // 真正的 BindInput/BindOutputToDevice 在 LMForward 每一步都会重新调用，
+                // 这里不需要预先 bind。
+                _ioBinding.ClearBoundInputs();
+                _ioBinding.ClearBoundOutputs();
+
+                // shape 变了：CUDA Graph（若开启）需要针对新 shape 重新 capture
+                _cudaGraphCapturedForCurrentShape = false;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[OmniVoiceLM] IOBinding 重建失败（{ex.Message}），" +
+                                  "本次运行永久回退标准 Run() 路径");
+                _ioBindingReady = false;
+                _enableCudaGraph = false;
+            }
+        }
+
+        _tensorS = sequenceLength;
+        _tensorBatch = batchSize;
+        Debug.Log($"[OmniVoiceLM] Tensor{(_ioBindingReady ? "+IOBinding" : "")} 重建: " +
+                  $"batch={batchSize} S={sequenceLength}");
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -912,8 +1145,7 @@ public class OmniVoiceLM : IDisposable
         else
         {
             // k 接近 n 时全排序更快
-            Array.Sort(_allScoresBuf, 0, totalMasked,
-                Comparer<(int, int, float)>.Create((a, b) => b.Item3.CompareTo(a.Item3)));
+            Array.Sort(_allScoresBuf, 0, totalMasked, _scoreDescendingComparer);
 
             for (int i = 0; i < newUnmaskCount; i++)
             {
@@ -1345,7 +1577,18 @@ public class OmniVoiceLM : IDisposable
     /// <summary>
     /// 释放 ONNX 会话资源
     /// </summary>
-    public void Dispose() => _session?.Dispose();
+    public void Dispose()
+    {
+        // [OPT-7] IOBinding / OrtValue 需要显式释放，顺序：先解绑，再释放 OrtValue，最后释放 session
+        try { _ioBinding?.ClearBoundInputs(); _ioBinding?.ClearBoundOutputs(); } catch { /* 忽略清理期异常 */ }
+        _ovIds?.Dispose();
+        _ovAudio?.Dispose();
+        _ovAttn?.Dispose();
+        _ovPos?.Dispose();
+        _ioBinding?.Dispose();
+        _runOptions?.Dispose();
+        _session?.Dispose();
+    }
 }
 
 /// <summary>

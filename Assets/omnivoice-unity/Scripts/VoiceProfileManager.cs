@@ -15,12 +15,14 @@ public class VoiceProfile
     public string createdAt;            // 创建时间
     public int frameCount;              // 帧数 T
     public byte[] codesData;            // refCodes 序列化数据 (long[8, T] 扁平化)
+
+    // 新增：存储音色元数据
+    public float sampleRate = 24000f;    // 采样率
+    public int codebookCount = 8;        // 码本数量
 }
 
 /// <summary>
 /// 音色管理器 - 保存和加载克隆的音色
-/// 核心原理：保存 AudioTokenizer.Encode() 输出的 refCodes，
-/// 下次直接传给 OmniVoiceLM.Generate()，跳过参考音频编码步骤
 /// </summary>
 public class VoiceProfileManager : MonoBehaviour
 {
@@ -30,6 +32,7 @@ public class VoiceProfileManager : MonoBehaviour
     private string _savePath;
     private Dictionary<string, VoiceProfile> _profiles = new Dictionary<string, VoiceProfile>();
     private List<string> _profileNames = new List<string>();
+    private Dictionary<string, long[,]> _cachedCodes = new Dictionary<string, long[,]>(); // 缓存解码后的 codes
 
     // 单例
     private static VoiceProfileManager _instance;
@@ -37,7 +40,11 @@ public class VoiceProfileManager : MonoBehaviour
 
     void Awake()
     {
-        if (_instance != null && _instance != this) { Destroy(gameObject); return; }
+        if (_instance != null && _instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
         _instance = this;
         DontDestroyOnLoad(gameObject);
 
@@ -49,13 +56,23 @@ public class VoiceProfileManager : MonoBehaviour
     #region 保存音色
 
     /// <summary>
-    /// 保存音色（从 OmniVoiceRunner 克隆完成后调用）</summary>
+    /// 保存音色（从 OmniVoiceRunner 克隆完成后调用）
+    /// </summary>
     public string SaveVoiceProfile(string name, long[,] refCodes, string refText = "")
     {
         if (refCodes == null || refCodes.GetLength(1) < 10)
         {
             Debug.LogError("[VoiceProfile] refCodes 无效，无法保存");
             return null;
+        }
+
+        // 检查名称是否已存在
+        if (_profiles.ContainsKey(name))
+        {
+            Debug.LogWarning($"[VoiceProfile] 音色 '{name}' 已存在，将覆盖");
+            // 清除缓存
+            if (_cachedCodes.ContainsKey(name))
+                _cachedCodes.Remove(name);
         }
 
         string speakerId = Guid.NewGuid().ToString("N")[..8];
@@ -71,7 +88,9 @@ public class VoiceProfileManager : MonoBehaviour
             referenceText = refText,
             createdAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
             frameCount = T,
-            codesData = data
+            codesData = data,
+            codebookCount = 8,
+            sampleRate = 24000f
         };
 
         // 保存到文件
@@ -80,18 +99,20 @@ public class VoiceProfileManager : MonoBehaviour
         string json = JsonUtility.ToJson(profile, false);
         File.WriteAllText(filePath, json);
 
-        // 更新索引
+        // 更新索引和缓存
         _profiles[name] = profile;
+        _cachedCodes[name] = refCodes; // 缓存解码后的数据
         if (!_profileNames.Contains(name)) _profileNames.Add(name);
         SaveProfileIndex();
 
         float dur = T * 960f / 24000f;
-        Debug.Log($"[VoiceProfile] 音色 '{name}' 已保存: {dur:F1}s ({T}帧) {data.Length}字节 → {filePath}");
+        Debug.Log($"[VoiceProfile] ✅ 音色 '{name}' 已保存: {dur:F1}s ({T}帧) {data.Length}字节 → {filePath}");
         return speakerId;
     }
 
     /// <summary>
-    /// 从参考音频编码并保存（便捷方法）</summary>
+    /// 从参考音频编码并保存（便捷方法）
+    /// </summary>
     public string SaveFromAudio(string name, AudioClip audio, AudioTokenizer tokenizer, string refText = "")
     {
         float[] pcm = AudioUtils.AudioClipToPCM(audio);
@@ -101,20 +122,47 @@ public class VoiceProfileManager : MonoBehaviour
 
     #endregion
 
-    #region 加载音色
+    #region 加载音色（核心：从音色文件克隆）
 
     /// <summary>
-    /// 加载音色的 refCodes（用于 Generate）</summary>
-    public long[,] LoadCodes(string name)
+    /// 【核心方法】从音色文件加载 refCodes（用于 Generate）
+    /// 这就是"从音色文件克隆"的本质：直接加载预计算的 codes，无需重新编码
+    /// </summary>
+    public long[,] LoadCodes(string name, bool useCache = true)
     {
+        // 优先从缓存获取
+        if (useCache && _cachedCodes.TryGetValue(name, out long[,] cached))
+        {
+            Debug.Log($"[VoiceProfile] 从缓存加载音色 '{name}'");
+            return cached;
+        }
+
         VoiceProfile profile = GetProfile(name);
         if (profile == null) return null;
 
-        return DeserializeCodes(profile.codesData, profile.frameCount);
+        try
+        {
+            long[,] codes = DeserializeCodes(profile.codesData, profile.frameCount);
+
+            // 存入缓存
+            if (useCache)
+                _cachedCodes[name] = codes;
+
+            float dur = profile.frameCount * 960f / 24000f;
+            Debug.Log($"[VoiceProfile] ✅ 从文件加载音色 '{name}': {dur:F1}s ({profile.frameCount}帧)");
+
+            return codes;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[VoiceProfile] 加载音色 '{name}' 失败: {e.Message}");
+            return null;
+        }
     }
 
     /// <summary>
-    /// 获取音色配置</summary>
+    /// 获取音色的元数据（不加载 codes）
+    /// </summary>
     public VoiceProfile GetProfile(string name)
     {
         if (_profiles.TryGetValue(name, out var profile))
@@ -123,19 +171,41 @@ public class VoiceProfileManager : MonoBehaviour
     }
 
     /// <summary>
-    /// 获取所有音色名称</summary>
+    /// 获取所有音色名称
+    /// </summary>
     public List<string> GetAllProfileNames() => new List<string>(_profileNames);
 
     /// <summary>
-    /// 检查音色是否存在</summary>
+    /// 检查音色是否存在
+    /// </summary>
     public bool HasProfile(string name) => _profiles.ContainsKey(name);
+
+    /// <summary>
+    /// 获取音色的帧数
+    /// </summary>
+    public int GetProfileFrameCount(string name)
+    {
+        var profile = GetProfile(name);
+        return profile?.frameCount ?? 0;
+    }
+
+    /// <summary>
+    /// 获取音色的时长（秒）
+    /// </summary>
+    public float GetProfileDuration(string name)
+    {
+        var profile = GetProfile(name);
+        if (profile == null) return 0f;
+        return profile.frameCount * 960f / 24000f;
+    }
 
     #endregion
 
     #region 删除音色
 
     /// <summary>
-    /// 删除音色</summary>
+    /// 删除音色
+    /// </summary>
     public bool DeleteProfile(string name)
     {
         VoiceProfile profile = GetProfile(name);
@@ -146,9 +216,12 @@ public class VoiceProfileManager : MonoBehaviour
         string filePath = Path.Combine(_savePath, fileName);
         if (File.Exists(filePath)) File.Delete(filePath);
 
-        // 更新索引
+        // 更新索引和缓存
         _profiles.Remove(name);
         _profileNames.Remove(name);
+        if (_cachedCodes.ContainsKey(name))
+            _cachedCodes.Remove(name);
+
         SaveProfileIndex();
 
         Debug.Log($"[VoiceProfile] 音色 '{name}' 已删除");
@@ -160,7 +233,8 @@ public class VoiceProfileManager : MonoBehaviour
     #region 序列化工具
 
     /// <summary>
-    /// 将 long[8, T] 序列化为 byte[]</summary>
+    /// 将 long[8, T] 序列化为 byte[]
+    /// </summary>
     private byte[] SerializeCodes(long[,] codes)
     {
         int cb = codes.GetLength(0); // 8
@@ -171,7 +245,8 @@ public class VoiceProfileManager : MonoBehaviour
     }
 
     /// <summary>
-    /// 从 byte[] 反序列化出 long[8, T]</summary>
+    /// 从 byte[] 反序列化出 long[8, T]
+    /// </summary>
     private long[,] DeserializeCodes(byte[] data, int T)
     {
         int cb = 8;
@@ -195,6 +270,7 @@ public class VoiceProfileManager : MonoBehaviour
         string indexPath = Path.Combine(_savePath, "index.json");
         _profiles.Clear();
         _profileNames.Clear();
+        _cachedCodes.Clear();
 
         if (!File.Exists(indexPath)) return;
 
@@ -214,6 +290,7 @@ public class VoiceProfileManager : MonoBehaviour
                     }
                 }
             }
+            Debug.Log($"[VoiceProfile] 加载了 {_profileNames.Count} 个音色");
         }
         catch (Exception e)
         {

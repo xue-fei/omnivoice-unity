@@ -14,3 +14,4 @@ https://github.com/xue-fei/onnxruntime-unity-cuda.git
 26.5.20 DML加速还是挺慢的，生成的音频偶尔缺头、混乱  
   
 26.6.8 CUDA 1070 RTF 2左右  
+26.8.1 CUDA 1070 RTF 1左右  

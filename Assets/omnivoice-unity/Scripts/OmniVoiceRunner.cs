@@ -29,7 +29,7 @@ public class OmniVoiceRunner : MonoBehaviour
     [Tooltip("扩散步数，原版默认 32；速度优先可降至 16")]
     public int numStep = 32;
     [Tooltip("CFG 引导强度，原版默认 2.0；若输出异常可尝试 0（关闭 CFG）")]
-    public float guidanceScale = 2.0f;
+    public float guidanceScale = 1.0f;
     [Tooltip("调度时移 τ，原版默认 0.1")]
     public float tShift = 0.1f;
     [Tooltip("position_temperature: 位置选择温度，原版默认 5.0")]
@@ -38,6 +38,8 @@ public class OmniVoiceRunner : MonoBehaviour
     public float classTemperature = 0.0f;
     [Tooltip("层惩罚系数，原版默认 5.0；控制 codebook 从低到高逐层解 mask")]
     public float layerPenaltyFactor = 5.0f;
+    [Tooltip("[OPT-11] 调度加速倍率：1.0=原版，2.0=2倍速，3.0=3倍速，4.0=4倍速。推荐3.0")]
+    public float scheduleAcceleration = 3.0f;
     [Tooltip("目标生成时长（秒）。0 = 按文字长度自动估算")]
     public float targetDurSec = 0f;
 
@@ -64,6 +66,7 @@ public class OmniVoiceRunner : MonoBehaviour
             PositionTemperature = positionTemperature,
             ClassTemperature = classTemperature,
             LayerPenaltyFactor = layerPenaltyFactor,
+            ScheduleAcceleration = scheduleAcceleration,
         };
 
         _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);

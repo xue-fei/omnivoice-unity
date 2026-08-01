@@ -36,6 +36,8 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
     public float positionTemperature = 5.0f;
     public float classTemperature = 0.0f;
     public float layerPenaltyFactor = 5.0f;
+    [Tooltip("[OPT-11] 调度加速倍率：1.0=原版，2.0=2倍速，3.0=3倍速。推荐3.0")]
+    public float scheduleAcceleration = 3.0f;
     public float targetDurSec = 0f;
 
     [Header("音色管理 UI")]
@@ -93,6 +95,7 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
                 PositionTemperature = positionTemperature,
                 ClassTemperature = classTemperature,
                 LayerPenaltyFactor = layerPenaltyFactor,
+                ScheduleAcceleration = scheduleAcceleration,
             };
 
             _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);

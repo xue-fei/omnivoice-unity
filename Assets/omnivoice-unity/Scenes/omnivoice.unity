@@ -303,11 +303,12 @@ MonoBehaviour:
   executionProvider: 1
   deviceId: 0
   numStep: 32
-  guidanceScale: 2
+  guidanceScale: 1
   tShift: 0.1
   positionTemperature: 5
   classTemperature: 0
   layerPenaltyFactor: 5
+  scheduleAcceleration: 3
   targetDurSec: 0
 --- !u!82 &384914473
 AudioSource:

@@ -10,3 +10,5 @@ Temp
 .vs
 obj
 Omnivoice-onnx
+Assets/StreamingAssets/VoiceProfiles
+Assets/StreamingAssets/VoiceProfiles.meta

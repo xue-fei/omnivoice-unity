@@ -310,6 +310,15 @@ MonoBehaviour:
   layerPenaltyFactor: 5
   scheduleAcceleration: 3
   targetDurSec: 0
+  onModelReady:
+    m_PersistentCalls:
+      m_Calls: []
+  onModelLoadFailed:
+    m_PersistentCalls:
+      m_Calls: []
+  onGenerationComplete:
+    m_PersistentCalls:
+      m_Calls: []
 --- !u!82 &384914473
 AudioSource:
   m_ObjectHideFlags: 0

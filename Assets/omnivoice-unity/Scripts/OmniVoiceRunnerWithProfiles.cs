@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Collections;
-using System.Diagnostics;
 using UnityEngine;
 using UnityEngine.UI;
 using Debug = UnityEngine.Debug;
@@ -9,6 +8,7 @@ using Debug = UnityEngine.Debug;
 /// <summary>
 /// OmniVoiceRunner 扩展 - 集成音色管理功能
 /// 核心功能：从音色文件克隆并生成音频，支持 RTF 计算
+/// 异步初始化 + 异步推理，不阻塞主线程
 /// </summary>
 public class OmniVoiceRunnerWithProfiles : MonoBehaviour
 {
@@ -50,7 +50,11 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
     public Button deleteProfileButton;
     public Text selectedProfileInfo;
     public Text statusText;
-    public Text rtfText;  // 显示 RTF 信息
+    public Text rtfText;
+
+    [Header("状态回调")]
+    public UnityEngine.Events.UnityEvent onModelReady;
+    public UnityEngine.Events.UnityEvent<string> onModelLoadFailed;
 
     // RTF 统计
     private RTFStatistics _rtfStats = new RTFStatistics();
@@ -59,6 +63,7 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
     private AudioTokenizer _tokenizer;
     private Qwen2Tokenizer _textTok;
     private bool _isGenerating;
+    private bool _modelReady;
 
     // 当前使用的音色 codes
     private long[,] _currentRefCodes;
@@ -66,11 +71,13 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
     private float _currentRefRms;
     private string _currentProfileName;
 
+    public bool IsReady => _modelReady;
+    public bool IsGenerating => _isGenerating;
+
     void Start()
     {
         Application.targetFrameRate = 60;
-
-        InitializeModels();
+        InitializeModelsAsync();
         InitializeVoiceProfileManager();
         SetupUI();
         RefreshVoiceProfileList();
@@ -78,41 +85,58 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
         UpdateRTFDisplay();
     }
 
-    private void InitializeModels()
+    private void InitializeModelsAsync()
     {
-        string lmPath = Path.Combine(Application.streamingAssetsPath, lmModelRelPath);
-        string encPath = Path.Combine(Application.streamingAssetsPath, encModelRelPath);
-        string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
-        string tokPath = Path.Combine(Application.streamingAssetsPath, tokenizerJsonRelPath);
+        Debug.Log("[OmniVoice] 开始异步加载模型...");
+        UpdateStatus("正在加载模型...");
 
-        try
+        Loom.RunAsync(() =>
         {
-            _lm = new OmniVoiceLM(lmPath, executionProvider, deviceId)
+            try
             {
-                NumStep = numStep,
-                GuidanceScale = guidanceScale,
-                TShift = tShift,
-                PositionTemperature = positionTemperature,
-                ClassTemperature = classTemperature,
-                LayerPenaltyFactor = layerPenaltyFactor,
-                ScheduleAcceleration = scheduleAcceleration,
-            };
+                string lmPath = Path.Combine(Application.streamingAssetsPath, lmModelRelPath);
+                string encPath = Path.Combine(Application.streamingAssetsPath, encModelRelPath);
+                string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
+                string tokPath = Path.Combine(Application.streamingAssetsPath, tokenizerJsonRelPath);
 
-            _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);
+                _lm = new OmniVoiceLM(lmPath, executionProvider, deviceId)
+                {
+                    NumStep = numStep,
+                    GuidanceScale = guidanceScale,
+                    TShift = tShift,
+                    PositionTemperature = positionTemperature,
+                    ClassTemperature = classTemperature,
+                    LayerPenaltyFactor = layerPenaltyFactor,
+                    ScheduleAcceleration = scheduleAcceleration,
+                };
 
-            if (File.Exists(tokPath))
-            {
-                _textTok = Qwen2Tokenizer.Load(tokPath);
+                _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);
+
+                if (File.Exists(tokPath))
+                {
+                    _textTok = Qwen2Tokenizer.Load(tokPath);
+                }
+
+                // 回到主线程标记完成
+                Loom.QueueOnMainThread(() =>
+                {
+                    _modelReady = true;
+                    Debug.Log("[OmniVoice] 模型异步加载成功");
+                    UpdateStatus("模型已加载");
+                    onModelReady?.Invoke();
+                });
             }
-
-            Debug.Log("[OmniVoice] 模型初始化成功");
-            UpdateStatus("模型已加载");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"[OmniVoice] 模型初始化失败: {e.Message}");
-            UpdateStatus($"模型加载失败: {e.Message}");
-        }
+            catch (Exception e)
+            {
+                Debug.LogError($"[OmniVoice] 模型加载失败: {e.Message}");
+                Loom.QueueOnMainThread(() =>
+                {
+                    _modelReady = false;
+                    UpdateStatus($"模型加载失败: {e.Message}");
+                    onModelLoadFailed?.Invoke(e.Message);
+                });
+            }
+        });
     }
 
     private void InitializeVoiceProfileManager()
@@ -323,7 +347,6 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
 
     #region 生成协程
 
-    // 在 CloneVoiceCoroutine 中修复引用
     private IEnumerator CloneVoiceCoroutine()
     {
         if (_isGenerating) yield break;
@@ -354,35 +377,46 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
                 for (int i = 0; i < refPCM.Length; i++) refPCM[i] *= scale;
             }
 
-            try
-            {
-                _currentRefCodes = _tokenizer.Encode(refPCM);
-                _currentTRef = _currentRefCodes.GetLength(1);
+            // 异步编码
+            long[,] encodedCodes = null;
+            Exception encodeErr = null;
+            bool encodeDone = false;
 
-                const int MAX_REF = 500;
-                if (_currentTRef > MAX_REF)
-                {
-                    var truncated = new long[8, MAX_REF];
-                    for (int cb = 0; cb < 8; cb++)
-                        for (int t = 0; t < MAX_REF; t++)
-                            truncated[cb, t] = _currentRefCodes[cb, t];
-                    _currentRefCodes = truncated;
-                    _currentTRef = MAX_REF;
-                }
-
-                _rtfStats.EndEncoding();
-                // 修复：使用 EncodingTimeMs 而不是 LastEncodingTimeMs
-                Debug.Log($"[OmniVoice] 参考音频编码完成: {_currentTRef}帧, 编码耗时: {_rtfStats.EncodingTimeMs:F1}ms");
-                UpdateStatus($"音频编码完成，正在生成...");
-                UpdateProfileInfo(null);
-            }
-            catch (Exception e)
+            Loom.RunAsync(() =>
             {
-                Debug.LogError($"[OmniVoice] 音频编码失败: {e.Message}");
-                UpdateStatus($"音频编码失败: {e.Message}");
+                try { encodedCodes = _tokenizer.Encode(refPCM); }
+                catch (Exception e) { encodeErr = e; }
+                finally { encodeDone = true; }
+            });
+
+            yield return new WaitUntil(() => encodeDone);
+
+            if (encodeErr != null)
+            {
+                Debug.LogError($"[OmniVoice] 音频编码失败: {encodeErr.Message}");
+                UpdateStatus($"音频编码失败: {encodeErr.Message}");
                 _isGenerating = false;
                 yield break;
             }
+
+            _currentRefCodes = encodedCodes;
+            _currentTRef = _currentRefCodes.GetLength(1);
+
+            const int MAX_REF = 500;
+            if (_currentTRef > MAX_REF)
+            {
+                var truncated = new long[8, MAX_REF];
+                for (int cb = 0; cb < 8; cb++)
+                    for (int t = 0; t < MAX_REF; t++)
+                        truncated[cb, t] = _currentRefCodes[cb, t];
+                _currentRefCodes = truncated;
+                _currentTRef = MAX_REF;
+            }
+
+            _rtfStats.EndEncoding();
+            Debug.Log($"[OmniVoice] 参考音频编码完成: {_currentTRef}帧, 编码耗时: {_rtfStats.EncodingTimeMs:F1}ms");
+            UpdateStatus($"音频编码完成，正在生成...");
+            UpdateProfileInfo(null);
         }
         else
         {
@@ -436,22 +470,22 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
 
         UpdateStatus($"正在生成音频 (目标长度: {targetLen}帧)...");
 
+        // 异步推理
         long[,] generatedCodes = null;
-        bool done = false;
         Exception err = null;
+        bool inferenceDone = false;
 
-        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        Loom.RunAsync(() =>
         {
             try
             {
-                // 记录生成开始时间
                 generatedCodes = _lm.Generate(textTokenIds, _currentRefCodes, targetLen);
             }
             catch (Exception e) { err = e; }
-            finally { done = true; }
+            finally { inferenceDone = true; }
         });
 
-        while (!done) yield return null;
+        yield return new WaitUntil(() => inferenceDone);
 
         // 记录生成结束时间
         _rtfStats.EndGeneration();
@@ -472,10 +506,26 @@ public class OmniVoiceRunnerWithProfiles : MonoBehaviour
 
         UpdateStatus("正在解码音频...");
 
-        // 解码计时
-        _rtfStats.StartDecoding();
-        float[] pcm = _tokenizer.Decode(generatedCodes);
+        // 异步解码
+        float[] pcm = null;
+        bool decodeDone = false;
+        Loom.RunAsync(() =>
+        {
+            try { pcm = _tokenizer.Decode(generatedCodes); }
+            catch (Exception e) { Debug.LogError($"[OmniVoice] 解码异常: {e.Message}"); }
+            finally { decodeDone = true; }
+        });
+
+        yield return new WaitUntil(() => decodeDone);
+
         _rtfStats.EndDecoding();
+
+        if (pcm == null)
+        {
+            Debug.LogError("[OmniVoice] 解码失败");
+            UpdateStatus("解码失败");
+            yield break;
+        }
 
         // 后处理
         if (_currentRefRms >= 0f && _currentRefRms < 0.1f)

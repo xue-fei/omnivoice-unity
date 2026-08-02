@@ -3,6 +3,10 @@ using System.IO;
 using System.Collections;
 using UnityEngine;
 
+/// <summary>
+/// OmniVoiceRunner — 语音克隆与生成入口
+/// 异步初始化和推理，不阻塞主线程。
+/// </summary>
 public class OmniVoiceRunner : MonoBehaviour
 {
     [Header("音频设置")]
@@ -43,49 +47,96 @@ public class OmniVoiceRunner : MonoBehaviour
     [Tooltip("目标生成时长（秒）。0 = 按文字长度自动估算")]
     public float targetDurSec = 0f;
 
+    [Header("状态回调")]
+    /// <summary>模型加载完成回调（主线程）</summary>
+    public UnityEngine.Events.UnityEvent onModelReady;
+    /// <summary>模型加载失败回调（主线程，参数为错误消息）</summary>
+    public UnityEngine.Events.UnityEvent<string> onModelLoadFailed;
+    /// <summary>生成完成回调（主线程，参数为 RTF 字符串）</summary>
+    public UnityEngine.Events.UnityEvent<string> onGenerationComplete;
+
     OmniVoiceLM _lm;
     AudioTokenizer _tokenizer;
     Qwen2Tokenizer _textTok;
     bool _isGenerating;
+    bool _modelReady;
+
+    public bool IsReady => _modelReady;
+    public bool IsGenerating => _isGenerating;
 
     void Start()
     {
         Application.targetFrameRate = 60;
-
-        string lmPath = Path.Combine(Application.streamingAssetsPath, lmModelRelPath);
-        string encPath = Path.Combine(Application.streamingAssetsPath, encModelRelPath);
-        string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
-        string tokPath = Path.Combine(Application.streamingAssetsPath, tokenizerJsonRelPath);
-
-        // ★ 将 EP 选择和 deviceId 透传给 LM
-        _lm = new OmniVoiceLM(lmPath, executionProvider, deviceId)
-        {
-            NumStep = numStep,
-            GuidanceScale = guidanceScale,
-            TShift = tShift,
-            PositionTemperature = positionTemperature,
-            ClassTemperature = classTemperature,
-            LayerPenaltyFactor = layerPenaltyFactor,
-            ScheduleAcceleration = scheduleAcceleration,
-        };
-
-        _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);
-
-        if (File.Exists(tokPath))
-        {
-            _textTok = Qwen2Tokenizer.Load(tokPath);
-            if (_textTok != null)
-                Debug.Log("[OmniVoiceRunner] 文本 Tokenizer 已加载");
-        }
-        else
-        {
-            Debug.LogWarning($"[OmniVoiceRunner] 未找到 tokenizer.json ({tokPath})");
-        }
-
-        Debug.Log($"[OmniVoiceRunner] 初始化完成 (EP={executionProvider}, device={deviceId})");
+        // 异步初始化模型，不阻塞主线程
+        InitializeModelsAsync();
     }
 
-    public void CloneVoice() => StartCoroutine(CloneVoiceCoroutine());
+    /// <summary>
+    /// 在后台线程异步加载模型，完成后回调主线程。
+    /// </summary>
+    private void InitializeModelsAsync()
+    {
+        Debug.Log("[OmniVoiceRunner] 开始异步加载模型...");
+
+        Loom.RunAsync(() =>
+        {
+            try
+            {
+                string lmPath = Path.Combine(Application.streamingAssetsPath, lmModelRelPath);
+                string encPath = Path.Combine(Application.streamingAssetsPath, encModelRelPath);
+                string decPath = Path.Combine(Application.streamingAssetsPath, decModelRelPath);
+                string tokPath = Path.Combine(Application.streamingAssetsPath, tokenizerJsonRelPath);
+
+                _lm = new OmniVoiceLM(lmPath, executionProvider, deviceId)
+                {
+                    NumStep = numStep,
+                    GuidanceScale = guidanceScale,
+                    TShift = tShift,
+                    PositionTemperature = positionTemperature,
+                    ClassTemperature = classTemperature,
+                    LayerPenaltyFactor = layerPenaltyFactor,
+                    ScheduleAcceleration = scheduleAcceleration,
+                };
+
+                _tokenizer = new AudioTokenizer(encPath, decPath, executionProvider, deviceId);
+
+                if (File.Exists(tokPath))
+                {
+                    _textTok = Qwen2Tokenizer.Load(tokPath);
+                }
+
+                // 回到主线程标记完成
+                Loom.QueueOnMainThread(() =>
+                {
+                    _modelReady = true;
+                    Debug.Log($"[OmniVoiceRunner] 模型异步加载完成 (EP={executionProvider}, device={deviceId})");
+                    onModelReady?.Invoke();
+                });
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[OmniVoiceRunner] 模型加载失败: {e.Message}");
+                Loom.QueueOnMainThread(() =>
+                {
+                    _modelReady = false;
+                    onModelLoadFailed?.Invoke(e.Message);
+                });
+            }
+        });
+    }
+
+    /// <summary>
+    /// 开始语音克隆。
+    /// </summary>
+    public void CloneVoice()
+    {
+        if (!_modelReady)
+        {
+            Debug.LogWarning("[OmniVoiceRunner] 模型尚未加载完成");
+            return;
+        }
+        StartCoroutine(CloneVoiceCoroutine());
+    }
 
     void OnDestroy()
     {
@@ -123,8 +174,6 @@ public class OmniVoiceRunner : MonoBehaviour
             float refDur = T_ref * 960f / 24000f;
             Debug.Log($"[OmniVoiceRunner] 参考音频: {refDur:F1}s ({T_ref} 帧)  RMS={refRms:F4}");
 
-            // Python 参考实现最长允许 ~20s（500 帧）；之前 150 帧（6s）过于保守，
-            // 会导致参考语速基准帧数过少，EstimateTargetLen 估算偏差加大。
             const int MAX_REF_FRAMES = 500;
             if (T_ref > MAX_REF_FRAMES)
             {
@@ -140,7 +189,7 @@ public class OmniVoiceRunner : MonoBehaviour
             if (refDur < 2f) Debug.LogWarning("参考音频过短（< 2s），克隆质量可能较差");
         }
 
-        // 2. 构建文本 prompt 
+        // 2. 构建文本 prompt
         int[] textTokenIds;
         bool hasRefAudio = referenceAudio != null;
         string refTextStr = hasRefAudio && !string.IsNullOrEmpty(referenceText) ? referenceText : null;
@@ -162,19 +211,21 @@ public class OmniVoiceRunner : MonoBehaviour
         int targetLen = EstimateTargetLen(normalizedTarget, targetLanguage, T_ref);
         Debug.Log($"[OmniVoiceRunner] 目标帧数: {targetLen} ({targetLen * 960f / 24000f:F1}s)");
 
-        // 4. 后台线程推理
+        // 4. 异步推理（Loom 后台线程 + 主线程回调）
         long[,] generatedCodes = null;
-        bool done = false;
         Exception err = null;
 
-        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        // 每帧等待直到推理完成
+        bool inferenceDone = false;
+        Loom.RunAsync(() =>
         {
             try { generatedCodes = _lm.Generate(textTokenIds, refCodes, targetLen); }
             catch (Exception e) { err = e; }
-            finally { done = true; }
+            finally { inferenceDone = true; }
         });
 
-        while (!done) yield return null;
+        // 等待推理完成（不阻塞主线程，但会等推理结束）
+        yield return new WaitUntil(() => inferenceDone);
 
         if (err != null)
         {
@@ -190,8 +241,24 @@ public class OmniVoiceRunner : MonoBehaviour
             yield break;
         }
 
-        // 5. 解码
-        float[] pcm = _tokenizer.Decode(generatedCodes);
+        // 5. 解码（后台线程）
+        float[] pcm = null;
+        bool decodeDone = false;
+        Loom.RunAsync(() =>
+        {
+            try { pcm = _tokenizer.Decode(generatedCodes); }
+            catch (Exception e) { Debug.LogError($"[OmniVoiceRunner] 解码异常: {e.Message}"); }
+            finally { decodeDone = true; }
+        });
+
+        yield return new WaitUntil(() => decodeDone);
+
+        if (pcm == null)
+        {
+            Debug.LogError("[OmniVoiceRunner] 解码失败");
+            _isGenerating = false;
+            yield break;
+        }
 
         // 6. 后处理（对齐 Python _post_process_audio）
         if (refRms >= 0f && refRms < 0.1f)
@@ -206,14 +273,12 @@ public class OmniVoiceRunner : MonoBehaviour
             if (peak > 1e-6f)
                 for (int i = 0; i < pcm.Length; i++) pcm[i] = pcm[i] / peak * 0.5f;
         }
-        // ★ 修复：生成音频只做淡出，不做淡入。
-        // 淡入会把模型对音频开头 token 的预测（置信度本就偏低）静音掉，
-        // 导致"无参考文字时音频开头缺失"的问题。
         AudioUtils.ApplyFadeOut(pcm);
 
         float elapsed = Time.realtimeSinceStartup - t0;
         float audioDur = pcm.Length / 24000f;
-        Debug.Log($"[OmniVoiceRunner] ✅ 完成: 音频={audioDur:F1}s 耗时={elapsed:F1}s RTF={elapsed / audioDur:F2}");
+        string rtfMsg = $"RTF={elapsed / audioDur:F2} 音频={audioDur:F1}s 耗时={elapsed:F1}s";
+        Debug.Log($"[OmniVoiceRunner] ✅ 完成: {rtfMsg}");
 
         var clip = AudioUtils.PCMToAudioClip(pcm, "omnivoice_output");
         if (outputAudioSource != null) { outputAudioSource.clip = clip; outputAudioSource.Play(); }
@@ -221,6 +286,9 @@ public class OmniVoiceRunner : MonoBehaviour
         string savePath = Path.Combine(Application.dataPath, "omnivoice_output.wav");
         AudioUtils.SaveWav(savePath, pcm);
         Debug.Log($"[OmniVoiceRunner] 已保存至: {savePath}");
+
+        // 回调
+        onGenerationComplete?.Invoke(rtfMsg);
 
         _isGenerating = false;
     }

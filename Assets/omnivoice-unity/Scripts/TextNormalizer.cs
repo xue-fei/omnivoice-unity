@@ -127,7 +127,7 @@ public static class TextNormalizer
             else
             {
                 if (prevZero && sb.Length > 0) sb.Append("零");
-                string digitStr = (useGroupLiang && digit == 2 && i == 0) ? "两" : d[digit];
+                string digitStr = (useGroupLiang && digit == 2 && i == 0) ? "两" : Digits[digit];
                 sb.Append(digitStr);
                 sb.Append(Units[3 - i]);
                 prevZero = false;
